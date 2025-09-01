@@ -1,0 +1,1001 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simple HTTPS MCP Server for AWS Case Insights - Uses API Gateway with built-in SSL'
+
+Parameters:
+  UniqueIdentifier:
+    Type: String
+    Description: A unique identifier for the MCP server resources (should match your Case Insights deployment)
+    AllowedPattern: '[a-z0-9-]+'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    
+  CaseInsightsStackName:
+    Type: String
+    Description: Name of the existing Case Insights CloudFormation stack
+    
+  BedrockModelId:
+    Type: String
+    Description: The Bedrock model ID to use for AI analysis
+    Default: anthropic.claude-3-haiku-20240307-v1:0
+    
+  EnableCORS:
+    Type: String
+    Description: Enable CORS for web-based MCP clients
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    
+  StageName:
+    Type: String
+    Description: API Gateway stage name (use a different name if updating existing stack)
+    Default: 'v1'
+    AllowedPattern: '[a-zA-Z0-9]+'
+    ConstraintDescription: Must contain only alphanumeric characters
+
+Conditions:
+  EnableCORSCondition: !Equals [!Ref EnableCORS, 'true']
+
+Resources:
+  # CloudWatch Logs Role for API Gateway
+  ApiGatewayCloudWatchLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  # API Gateway Account Configuration
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchLogsRole.Arn
+
+  # IAM Role for MCP Lambda
+  MCPLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "MCPLambda-ExecutionRole-${UniqueIdentifier}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AthenaAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - athena:BatchGetQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StartQueryExecution
+                  - athena:StopQueryExecution
+                  - athena:GetWorkGroup
+                  - athena:ListQueryExecutions
+                Resource:
+                  - !Sub "arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/CaseInsights-${UniqueIdentifier}"
+                  - !Sub "arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/primary"
+        - PolicyName: GlueAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetPartitions
+                  - glue:GetTables
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/case_insights_${UniqueIdentifier}"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/case_insights_${UniqueIdentifier}/*"
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-caseprocessed"
+                  - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-caseprocessed/*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-athena-results"
+                  - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-athena-results/*"
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:ListFoundationModels
+                Resource: 
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/*"
+
+  # Lambda Function with MCP Protocol Support
+  MCPLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "MCP-CaseInsights-${UniqueIdentifier}"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt MCPLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          ATHENA_DATABASE: !Sub "case_insights_${UniqueIdentifier}"
+          ATHENA_WORKGROUP: !Sub "CaseInsights-${UniqueIdentifier}"
+          ATHENA_RESULTS_BUCKET: !Sub "s3-${UniqueIdentifier}-athena-results"
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          ENABLE_CORS: !Ref EnableCORS
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import time
+          import os
+          import re
+          from typing import Dict, List, Any, Optional
+          
+          # AWS clients
+          athena_client = boto3.client('athena')
+          bedrock_client = boto3.client('bedrock-runtime')
+          
+          # Configuration
+          ATHENA_DATABASE = os.getenv('ATHENA_DATABASE')
+          ATHENA_WORKGROUP = os.getenv('ATHENA_WORKGROUP', 'primary')
+          ATHENA_RESULTS_BUCKET = os.getenv('ATHENA_RESULTS_BUCKET')
+          BEDROCK_MODEL_ID = os.getenv('BEDROCK_MODEL_ID')
+          ENABLE_CORS = os.getenv('ENABLE_CORS', 'false').lower() == 'true'
+          
+          def get_cors_headers():
+              """Return CORS headers if enabled"""
+              if ENABLE_CORS:
+                  return {
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+                      'Access-Control-Max-Age': '86400'
+                  }
+              return {}
+          
+          def lambda_handler(event, context):
+              """Main Lambda handler for MCP requests"""
+              try:
+                  # Handle CORS preflight
+                  if event.get('httpMethod') == 'OPTIONS':
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              **get_cors_headers()
+                          },
+                          'body': json.dumps({'message': 'CORS preflight'})
+                      }
+                  
+                  # Parse the request
+                  method = event.get('httpMethod', 'POST')
+                  path = event.get('path', '/')
+                  body = json.loads(event.get('body', '{}')) if event.get('body') else {}
+                  
+                  # MCP Protocol Support
+                  if path == '/mcp' and method == 'POST':
+                      return handle_mcp_request(body)
+                  
+                  # REST API Support (backward compatibility)
+                  elif path == '/tools' and method == 'GET':
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              **get_cors_headers()
+                          },
+                          'body': json.dumps({
+                              'tools': [
+                                  {
+                                      'name': 'query_athena',
+                                      'description': 'Execute Athena SQL queries against case insights data',
+                                      'parameters': {
+                                          'query': 'SQL query string',
+                                          'max_results': 'Maximum number of results (optional, default 100)'
+                                      }
+                                  },
+                                  {
+                                      'name': 'analyze_with_bedrock',
+                                      'description': 'Analyze data using Bedrock AI models',
+                                      'parameters': {
+                                          'data': 'Data to analyze',
+                                          'analysis_prompt': 'Analysis prompt'
+                                      }
+                                  },
+                                  {
+                                      'name': 'get_case_summary',
+                                      'description': 'Get case summary with optional filters',
+                                      'parameters': {
+                                          'account_number': 'AWS account number (optional)',
+                                          'service_code': 'AWS service code (optional)',
+                                          'days_back': 'Days to look back (optional, default 30)'
+                                      }
+                                  },
+                                  {
+                                      'name': 'get_rca_analysis',
+                                      'description': 'Get RCA analysis for specific category',
+                                      'parameters': {
+                                          'rca_category': 'RCA category to analyze',
+                                          'limit': 'Maximum results (optional, default 10)'
+                                      }
+                                  },
+                                  {
+                                      'name': 'get_service_trends',
+                                      'description': 'Get service trends over time',
+                                      'parameters': {
+                                          'days_back': 'Days to analyze (optional, default 90)'
+                                      }
+                                  },
+                                  {
+                                      'name': 'analyze_case_summaries',
+                                      'description': 'Filter cases and analyze their summaries with Bedrock to identify top issues and patterns',
+                                      'parameters': {
+                                          'start_date': 'Start date (YYYY-MM-DD format)',
+                                          'end_date': 'End date (YYYY-MM-DD format)',
+                                          'severity_code': 'Filter by severity (low, normal, high, urgent, critical) (optional)',
+                                          'service_code': 'Filter by AWS service code (optional)',
+                                          'case_id': 'Filter by specific case ID (optional)',
+                                          'rca_category': 'Filter by RCA category (optional)',
+                                          'lifecycle_category': 'Filter by lifecycle category (optional)',
+                                          'analysis_question': 'Specific question to ask Bedrock (optional)',
+                                          'max_cases': 'Maximum cases to analyze (optional, default 200)'
+                                      }
+                                  }
+                              ]
+                          })
+                      }
+                  
+                  elif path.startswith('/tools/') and method == 'POST':
+                      tool_name = path.split('/')[-1]
+                      result = execute_tool(tool_name, body)
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              **get_cors_headers()
+                          },
+                          'body': json.dumps(result)
+                      }
+                  
+                  elif path == '/' and method == 'GET':
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              **get_cors_headers()
+                          },
+                          'body': json.dumps({
+                              'message': 'Case Insights MCP Server',
+                              'version': '1.0.0',
+                              'protocols': ['REST', 'MCP'],
+                              'endpoints': {
+                                  'mcp': '/mcp',
+                                  'tools': '/tools',
+                                  'health': '/'
+                              }
+                          })
+                      }
+                  
+                  else:
+                      return {
+                          'statusCode': 404,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              **get_cors_headers()
+                          },
+                          'body': json.dumps({'error': 'Not found'})
+                      }
+                      
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          **get_cors_headers()
+                      },
+                      'body': json.dumps({'error': str(e)})
+                  }
+          
+          def handle_mcp_request(body):
+              """Handle MCP protocol requests"""
+              try:
+                  method = body.get('method')
+                  params = body.get('params', {})
+                  request_id = body.get('id')
+                  
+                  if method == 'tools/list':
+                      result = {
+                          'tools': [
+                              {
+                                  'name': 'query_athena',
+                                  'description': 'Execute Athena SQL queries against case insights data',
+                                  'inputSchema': {
+                                      'type': 'object',
+                                      'properties': {
+                                          'query': {'type': 'string', 'description': 'SQL query to execute'},
+                                          'max_results': {'type': 'integer', 'description': 'Maximum results', 'default': 100}
+                                      },
+                                      'required': ['query']
+                                  }
+                              },
+                              {
+                                  'name': 'analyze_with_bedrock',
+                                  'description': 'Analyze data using Bedrock AI',
+                                  'inputSchema': {
+                                      'type': 'object',
+                                      'properties': {
+                                          'data': {'type': 'string', 'description': 'Data to analyze'},
+                                          'analysis_prompt': {'type': 'string', 'description': 'Analysis prompt'}
+                                      },
+                                      'required': ['data', 'analysis_prompt']
+                                  }
+                              },
+                              {
+                                  'name': 'get_case_summary',
+                                  'description': 'Get case summary with filters',
+                                  'inputSchema': {
+                                      'type': 'object',
+                                      'properties': {
+                                          'account_number': {'type': 'string', 'description': 'AWS account filter'},
+                                          'service_code': {'type': 'string', 'description': 'Service filter'},
+                                          'days_back': {'type': 'integer', 'description': 'Days back', 'default': 30}
+                                      }
+                                  }
+                              },
+                              {
+                                  'name': 'analyze_case_summaries',
+                                  'description': 'Filter cases and analyze their summaries with Bedrock to identify top issues and patterns',
+                                  'inputSchema': {
+                                      'type': 'object',
+                                      'properties': {
+                                          'start_date': {'type': 'string', 'description': 'Start date (YYYY-MM-DD)', 'pattern': '^\\d{4}-\\d{2}-\\d{2}$'},
+                                          'end_date': {'type': 'string', 'description': 'End date (YYYY-MM-DD)', 'pattern': '^\\d{4}-\\d{2}-\\d{2}$'},
+                                          'severity_code': {'type': 'string', 'description': 'Filter by severity', 'enum': ['low', 'normal', 'high', 'urgent', 'critical']},
+                                          'service_code': {'type': 'string', 'description': 'Filter by AWS service code'},
+                                          'case_id': {'type': 'string', 'description': 'Filter by specific case ID'},
+                                          'rca_category': {'type': 'string', 'description': 'Filter by RCA category'},
+                                          'lifecycle_category': {'type': 'string', 'description': 'Filter by lifecycle category'},
+                                          'analysis_question': {'type': 'string', 'description': 'Specific question to ask Bedrock'},
+                                          'max_cases': {'type': 'integer', 'description': 'Maximum cases to analyze', 'default': 200}
+                                      },
+                                      'required': ['start_date', 'end_date']
+                                  }
+                              }
+                          ]
+                      }
+                  elif method == 'tools/call':
+                      tool_name = params.get('name')
+                      tool_args = params.get('arguments', {})
+                      result = {'content': [{'type': 'text', 'text': json.dumps(execute_tool(tool_name, tool_args))}]}
+                  else:
+                      result = {'error': {'code': -32601, 'message': f'Method not found: {method}'}}
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          **get_cors_headers()
+                      },
+                      'body': json.dumps({
+                          'jsonrpc': '2.0',
+                          'id': request_id,
+                          'result': result
+                      })
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          **get_cors_headers()
+                      },
+                      'body': json.dumps({
+                          'jsonrpc': '2.0',
+                          'id': body.get('id'),
+                          'error': {'code': -32603, 'message': str(e)}
+                      })
+                  }
+          
+          def execute_tool(tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+              """Execute the specified tool with parameters"""
+              if tool_name == 'query_athena':
+                  return query_athena(params.get('query', ''), params.get('max_results', 100))
+              elif tool_name == 'analyze_with_bedrock':
+                  return analyze_with_bedrock(params.get('data', ''), params.get('analysis_prompt', ''))
+              elif tool_name == 'get_case_summary':
+                  return get_case_summary(
+                      params.get('account_number'),
+                      params.get('service_code'),
+                      params.get('days_back', 30)
+                  )
+              elif tool_name == 'get_rca_analysis':
+                  return get_rca_analysis(params.get('rca_category', ''), params.get('limit', 10))
+              elif tool_name == 'get_service_trends':
+                  return get_service_trends(params.get('days_back', 90))
+              elif tool_name == 'analyze_case_summaries':
+                  return analyze_case_summaries(
+                      params.get('start_date'),
+                      params.get('end_date'),
+                      params.get('severity_code'),
+                      params.get('service_code'),
+                      params.get('case_id'),
+                      params.get('rca_category'),
+                      params.get('lifecycle_category'),
+                      params.get('analysis_question', 'What are the top issues and patterns you see in these cases?'),
+                      params.get('max_cases', 200)
+                  )
+              else:
+                  raise ValueError(f"Unknown tool: {tool_name}")
+          
+          def query_athena(query: str, max_results: int = 100) -> Dict[str, Any]:
+              """Execute Athena query and return results"""
+              response = athena_client.start_query_execution(
+                  QueryString=query,
+                  QueryExecutionContext={'Database': ATHENA_DATABASE},
+                  WorkGroup=ATHENA_WORKGROUP,
+                  ResultConfiguration={
+                      'OutputLocation': f's3://{ATHENA_RESULTS_BUCKET}/queries/'
+                  }
+              )
+              
+              execution_id = response['QueryExecutionId']
+              
+              # Wait for query completion
+              while True:
+                  result = athena_client.get_query_execution(QueryExecutionId=execution_id)
+                  status = result['QueryExecution']['Status']['State']
+                  
+                  if status in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+                      break
+                  time.sleep(1)
+              
+              if status != 'SUCCEEDED':
+                  raise Exception(f"Query failed with status: {status}")
+              
+              # Get results
+              results = athena_client.get_query_results(
+                  QueryExecutionId=execution_id,
+                  MaxResults=max_results
+              )
+              
+              # Format results
+              columns = [col['Label'] for col in results['ResultSet']['ResultSetMetadata']['ColumnInfo']]
+              rows = []
+              
+              for row in results['ResultSet']['Rows'][1:]:  # Skip header
+                  row_data = {}
+                  for i, col in enumerate(columns):
+                      row_data[col] = row['Data'][i].get('VarCharValue', '')
+                  rows.append(row_data)
+              
+              return {
+                  "columns": columns,
+                  "rows": rows,
+                  "row_count": len(rows),
+                  "execution_id": execution_id
+              }
+          
+          def sanitize_analysis_question(question: str) -> str:
+              """Sanitize analysis question to prevent prompt injection"""
+              if not question or not isinstance(question, str):
+                  return "What are the top issues and patterns you see in these cases?"
+              
+              # Remove common prompt injection patterns
+              dangerous_patterns = [
+                  r'ignore\s+previous\s+instructions',
+                  r'forget\s+everything',
+                  r'system\s*:',
+                  r'assistant\s*:',
+                  r'human\s*:',
+                  r'<\s*/?system\s*>',
+                  r'```',
+                  r'---',
+                  r'\\n\\n',
+                  r'\n\n'
+              ]
+              
+              sanitized = question
+              for pattern in dangerous_patterns:
+                  sanitized = re.sub(pattern, ' ', sanitized, flags=re.IGNORECASE)
+              
+              # Limit length and clean up
+              sanitized = sanitized.strip()[:500]
+              if not sanitized:
+                  return "What are the top issues and patterns you see in these cases?"
+              
+              # Ensure it's a reasonable question
+              if not sanitized.endswith('?'):
+                  sanitized += '?'
+              
+              return sanitized
+
+          def analyze_with_bedrock(data: str, analysis_prompt: str) -> Dict[str, Any]:
+              """Analyze data using Bedrock with prompt injection protection"""
+              # Sanitize the analysis prompt
+              safe_prompt = sanitize_analysis_question(analysis_prompt)
+              
+              # Use structured template to prevent injection
+              prompt = f"""You are an AWS support case analyst. Your role is to analyze case summaries and provide insights.
+
+              ANALYSIS TASK: {safe_prompt}
+
+              CASE DATA TO ANALYZE:
+              {data}
+
+              REQUIRED OUTPUT FORMAT:
+              1. Summary of findings
+              2. Key patterns identified  
+              3. Recommendations
+
+              Focus only on the case data provided above. Do not reference external information or previous conversations."""
+              
+              response = bedrock_client.invoke_model(
+                  modelId=BEDROCK_MODEL_ID,
+                  body=json.dumps({
+                      "anthropic_version": "bedrock-2023-05-31",
+                      "max_tokens": 4000,
+                      "messages": [{"role": "user", "content": prompt}]
+                  })
+              )
+              
+              result = json.loads(response['body'].read())
+              return {
+                  "analysis": result['content'][0]['text'],
+                  "model_id": BEDROCK_MODEL_ID
+              }
+          
+          def get_case_summary(account_number: Optional[str] = None, 
+                             service_code: Optional[str] = None,
+                             days_back: int = 30) -> Dict[str, Any]:
+              """Get case summary with optional filters"""
+              where_clauses = []
+              
+              if account_number:
+                  where_clauses.append(f"account_number = '{account_number}'")
+              if service_code:
+                  where_clauses.append(f"servicecode = '{service_code}'")
+              
+              where_clauses.append(f"date(from_iso8601_timestamp(timecreated)) >= date_add('day', -{days_back}, current_date)")
+              
+              where_clause = " AND ".join(where_clauses)
+              
+              query = f"""
+              SELECT 
+                  COUNT(*) as total_cases,
+                  COUNT(DISTINCT account_number) as unique_accounts,
+                  COUNT(DISTINCT servicecode) as unique_services,
+                  rca_category,
+                  COUNT(*) as category_count
+              FROM case_summary
+              WHERE {where_clause}
+              GROUP BY rca_category
+              ORDER BY category_count DESC
+              """
+              
+              return query_athena(query)
+          
+          def get_rca_analysis(rca_category: str, limit: int = 10) -> Dict[str, Any]:
+              """Get detailed RCA analysis for a specific category"""
+              query = f"""
+              SELECT 
+                  account_number,
+                  case_number,
+                  subject,
+                  servicecode,
+                  severitycode,
+                  rca_category,
+                  rca_reason,
+                  timecreated
+              FROM case_summary
+              WHERE rca_category = '{rca_category}'
+              ORDER BY timecreated DESC
+              LIMIT {limit}
+              """
+              
+              return query_athena(query)
+          
+          def get_service_trends(days_back: int = 90) -> Dict[str, Any]:
+              """Get service trends over time"""
+              query = f"""
+              SELECT 
+                  servicecode,
+                  DATE_FORMAT(from_iso8601_timestamp(timecreated), '%Y-%m-%d') as date,
+                  COUNT(*) as case_count,
+                  rca_category
+              FROM case_summary
+              WHERE date(from_iso8601_timestamp(timecreated)) >= date_add('day', -{days_back}, current_date)
+              GROUP BY servicecode, DATE_FORMAT(from_iso8601_timestamp(timecreated), '%Y-%m-%d'), rca_category
+              ORDER BY date DESC, case_count DESC
+              """
+              
+              return query_athena(query)
+          
+          def analyze_case_summaries(start_date: str, end_date: str, severity_code: Optional[str] = None,
+                                   service_code: Optional[str] = None, case_id: Optional[str] = None,
+                                   rca_category: Optional[str] = None, lifecycle_category: Optional[str] = None,
+                                   analysis_question: str = "What are the top issues and patterns you see in these cases?",
+                                   max_cases: int = 200) -> Dict[str, Any]:
+              """Filter cases and analyze their summaries with Bedrock to identify top issues"""
+              try:
+                  # Validate date format
+                  date_pattern = r'^\d{4}-\d{2}-\d{2}$'
+                  if not re.match(date_pattern, start_date) or not re.match(date_pattern, end_date):
+                      raise ValueError("Dates must be in YYYY-MM-DD format")
+                  
+                  # Build WHERE clauses based on filters
+                  where_clauses = [
+                      f"DATE(from_iso8601_timestamp(timecreated)) BETWEEN DATE('{start_date}') AND DATE('{end_date}')"
+                  ]
+                  
+                  if severity_code:
+                      where_clauses.append(f"LOWER(severitycode) = LOWER('{severity_code}')")
+                  
+                  if service_code:
+                      where_clauses.append(f"UPPER(servicecode) = UPPER('{service_code}')")
+                  
+                  if case_id:
+                      where_clauses.append(f"case_number = '{case_id}'")
+                  
+                  if rca_category:
+                      where_clauses.append(f"rca_category = '{rca_category}'")
+                  
+                  if lifecycle_category:
+                      where_clauses.append(f"lifecycle_category = '{lifecycle_category}'")
+                  
+                  where_clause = " AND ".join(where_clauses)
+                  
+                  # Query to get case summaries with metadata
+                  query = f"""
+                  SELECT 
+                      case_number,
+                      subject,
+                      servicecode,
+                      severitycode,
+                      timecreated,
+                      rca_category,
+                      rca_reason,
+                      lifecycle_category,
+                      lifecycle_reason,
+                      case_summary,
+                      account_number
+                  FROM case_summary
+                  WHERE {where_clause}
+                    AND case_summary IS NOT NULL 
+                    AND LENGTH(TRIM(case_summary)) > 10
+                  ORDER BY 
+                      CASE severitycode 
+                          WHEN 'critical' THEN 1
+                          WHEN 'urgent' THEN 2  
+                          WHEN 'high' THEN 3
+                          WHEN 'normal' THEN 4
+                          WHEN 'low' THEN 5
+                          ELSE 6
+                      END,
+                      timecreated DESC
+                  LIMIT {max_cases}
+                  """
+                  
+                  # Execute the query
+                  athena_result = query_athena(query, max_cases)
+                  
+                  if not athena_result.get('rows'):
+                      return {
+                          'filters_applied': {
+                              'date_range': f"{start_date} to {end_date}",
+                              'severity_code': severity_code,
+                              'service_code': service_code,
+                              'case_id': case_id,
+                              'rca_category': rca_category,
+                              'lifecycle_category': lifecycle_category
+                          },
+                          'total_cases': 0,
+                          'analysis': 'No cases found matching the specified filters.',
+                          'summaries_analyzed': []
+                      }
+                  
+                  # Extract and truncate summaries for Bedrock analysis
+                  case_summaries = []
+                  case_metadata = []
+                  max_summary_chars = 700  # Limit each summary to 700 chars for token management
+                  
+                  for row in athena_result['rows']:
+                      summary_text = row.get('case_summary', '').strip()
+                      if summary_text and len(summary_text) > 10:  # Only include meaningful summaries
+                          # Truncate summary intelligently - try to end at sentence boundary
+                          if len(summary_text) > max_summary_chars:
+                              truncated = summary_text[:max_summary_chars]
+                              # Try to end at last sentence
+                              last_period = truncated.rfind('.')
+                              last_exclamation = truncated.rfind('!')
+                              last_question = truncated.rfind('?')
+                              last_sentence_end = max(last_period, last_exclamation, last_question)
+                              
+                              if last_sentence_end > max_summary_chars * 0.7:  # If we can keep 70%+ and end cleanly
+                                  summary_text = truncated[:last_sentence_end + 1]
+                              else:
+                                  summary_text = truncated + "..."
+                          
+                          case_summaries.append(summary_text)
+                          case_metadata.append({
+                              'case_number': row.get('case_number'),
+                              'service': row.get('servicecode'),
+                              'severity': row.get('severitycode'),
+                              'rca_category': row.get('rca_category'),
+                              'lifecycle_category': row.get('lifecycle_category'),
+                              'date': row.get('timecreated', '')[:10] if row.get('timecreated') else '',
+                              'summary_truncated': len(row.get('case_summary', '')) > max_summary_chars
+                          })
+                  
+                  if not case_summaries:
+                      return {
+                          'filters_applied': {
+                              'date_range': f"{start_date} to {end_date}",
+                              'severity_code': severity_code,
+                              'service_code': service_code,
+                              'case_id': case_id,
+                              'rca_category': rca_category,
+                              'lifecycle_category': lifecycle_category
+                          },
+                          'total_cases': len(athena_result['rows']),
+                          'analysis': 'Cases found but no meaningful summaries available for analysis.',
+                          'summaries_analyzed': []
+                      }
+                  
+                  # Intelligent batching to avoid token limits
+                  # Estimate tokens: ~4 chars per token for English text
+                  # With 500-char summaries: ~125 tokens per case + metadata
+                  max_input_tokens = 180000  # Leave buffer for Claude 3 Haiku's 200K limit
+                  prompt_tokens = 2000  # Estimated prompt size
+                  available_tokens = max_input_tokens - prompt_tokens
+                  
+                  # Prepare summaries with token management
+                  selected_summaries = []
+                  selected_metadata = []
+                  current_tokens = 0
+                  
+                  for summary, meta in zip(case_summaries, case_metadata):
+                      case_text = f"Case {meta['case_number']} ({meta['service']}, {meta['severity']}, {meta['date']}):\n{summary}"
+                      estimated_tokens = len(case_text) // 4  # Rough token estimation
+                      
+                      if current_tokens + estimated_tokens > available_tokens:
+                          break  # Stop before hitting token limit
+                      
+                      selected_summaries.append(case_text)
+                      selected_metadata.append(meta)
+                      current_tokens += estimated_tokens
+                  
+                  summaries_text = "\n\n---CASE SUMMARY---\n".join(selected_summaries)
+                  actual_cases_analyzed = len(selected_summaries)
+                  
+                  # Create focused analysis prompt
+                  filter_description = []
+                  if severity_code:
+                      filter_description.append(f"severity: {severity_code}")
+                  if service_code:
+                      filter_description.append(f"service: {service_code}")
+                  if rca_category:
+                      filter_description.append(f"RCA category: {rca_category}")
+                  if lifecycle_category:
+                      filter_description.append(f"lifecycle category: {lifecycle_category}")
+                  
+                  filters_text = f" (filtered by {', '.join(filter_description)})" if filter_description else ""
+                  
+                  truncation_note = ""
+                  if actual_cases_analyzed < len(case_summaries):
+                      truncation_note = f"\n\nNOTE: Due to token limits, analyzing the first {actual_cases_analyzed} cases out of {len(case_summaries)} available (prioritized by severity and date)."
+                  
+                  analysis_prompt = f"""
+                  You are analyzing {actual_cases_analyzed} AWS support case summaries from {start_date} to {end_date}{filters_text}.{truncation_note}
+                  
+                  Question: {analysis_question}
+                  
+                  Please analyze these case summaries and provide:
+                  
+                  1. **TOP ISSUES IDENTIFIED**: List the most common problems/issues you see across these cases
+                  2. **PATTERNS & TRENDS**: What patterns do you notice in terms of:
+                     - Common root causes
+                     - Affected services
+                     - Issue types
+                     - Timing patterns
+                  3. **SEVERITY ANALYSIS**: How do issues vary by severity level?
+                  4. **RECOMMENDATIONS**: Based on these patterns, what preventive measures or improvements would you recommend?
+                  5. **NOTABLE CASES**: Highlight any particularly interesting or concerning cases
+                  
+                  Focus on actionable insights that could help prevent similar issues in the future.
+                  Be specific about the problems you identify and provide concrete examples from the summaries.
+                  """
+                  
+                  # Analyze with Bedrock
+                  bedrock_result = analyze_with_bedrock(summaries_text, analysis_prompt)
+                  
+                  # Combine results
+                  return {
+                      'filters_applied': {
+                          'date_range': f"{start_date} to {end_date}",
+                          'severity_code': severity_code,
+                          'service_code': service_code,
+                          'case_id': case_id,
+                          'rca_category': rca_category,
+                          'lifecycle_category': lifecycle_category
+                      },
+                      'total_cases_found': len(athena_result['rows']),
+                      'summaries_available': len(case_summaries),
+                      'summaries_analyzed': actual_cases_analyzed,
+                      'token_management': {
+                          'estimated_input_tokens': current_tokens,
+                          'max_input_tokens': max_input_tokens,
+                          'cases_truncated_for_tokens': actual_cases_analyzed < len(case_summaries),
+                          'summaries_truncated_for_length': sum(1 for meta in selected_metadata if meta.get('summary_truncated', False)),
+                          'max_summary_chars': max_summary_chars
+                      },
+                      'analysis_question': analysis_question,
+                      'case_summaries_sent_to_bedrock': summaries_text,
+                      'analysis': bedrock_result['analysis'],
+                      'model_used': bedrock_result['model_id'],
+                      'sample_cases': selected_metadata[:5],  # Show first 5 cases as examples
+                      'query_execution_id': athena_result['execution_id']
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'error': f"Failed to analyze case summaries: {str(e)}",
+                      'filters_applied': {
+                          'date_range': f"{start_date} to {end_date}",
+                          'severity_code': severity_code,
+                          'service_code': service_code,
+                          'case_id': case_id,
+                          'rca_category': rca_category,
+                          'lifecycle_category': lifecycle_category
+                      },
+                      'total_cases_found': 0,
+                      'summaries_analyzed': 0
+                  }
+
+  # API Gateway with HTTPS (built-in SSL)
+  MCPApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "mcp-case-insights-api-${UniqueIdentifier}"
+      Description: HTTPS API Gateway for MCP Case Insights server (no resource policy)
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway Resources and Methods
+  MCPApiProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref MCPApiGateway
+      ParentId: !GetAtt MCPApiGateway.RootResourceId
+      PathPart: "{proxy+}"
+
+  MCPApiProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref MCPApiGateway
+      ResourceId: !Ref MCPApiProxyResource
+      HttpMethod: ANY
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MCPLambdaFunction.Arn}/invocations"
+
+  MCPApiRootMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref MCPApiGateway
+      ResourceId: !GetAtt MCPApiGateway.RootResourceId
+      HttpMethod: ANY
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MCPLambdaFunction.Arn}/invocations"
+
+  # Lambda permissions for API Gateway
+  MCPLambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MCPLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MCPApiGateway}/*/*"
+
+  # API Gateway Deployment
+  MCPApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - MCPApiRootMethod
+      - MCPApiProxyMethod
+    Properties:
+      RestApiId: !Ref MCPApiGateway
+
+  # CloudWatch Log Group for MCP API Access Logs
+  MCPApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/mcp-case-insights-access-${UniqueIdentifier}"
+      RetentionInDays: 30
+
+  # API Gateway Stage with Throttling and Access Logging
+  MCPApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: !Ref StageName
+      RestApiId: !Ref MCPApiGateway
+      DeploymentId: !Ref MCPApiDeployment
+      AccessLogSetting:
+        DestinationArn: !GetAtt MCPApiAccessLogGroup.Arn
+        Format: !Sub '{"requestId":"$context.requestId","timestamp":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","protocol":"$context.protocol","status":"$context.status","responseLength":"$context.responseLength","requestLength":"$context.requestLength","responseTime":"$context.responseTime","clientIp":"$context.identity.sourceIp","userAgent":"$context.identity.userAgent","caller":"$context.identity.caller","user":"$context.identity.user","apiId":"${MCPApiGateway}","stage":"${StageName}","error":"$context.error.message"}'
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingRateLimit: 5
+          ThrottlingBurstLimit: 15
+
+  # IAM Policy for MCP Users
+  MCPUserPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "MCPCaseInsights-UserAccess-${UniqueIdentifier}"
+      Description: "Allows access to the MCP Case Insights API"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - execute-api:Invoke
+            Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MCPApiGateway}/*/*"
+
+Outputs:
+  MCPServerEndpoint:
+    Description: MCP Server HTTPS endpoint URL (ready for MCP clients)
+    Value: !Sub "https://${MCPApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-MCPServerEndpoint"
+      
+  MCPServerHealthCheck:
+    Description: Health check endpoint
+    Value: !Sub "https://${MCPApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/"
+    
+  MCPServerToolsEndpoint:
+    Description: Tools listing endpoint
+    Value: !Sub "https://${MCPApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/tools"
+    
+  MCPProtocolEndpoint:
+    Description: MCP protocol endpoint
+    Value: !Sub "https://${MCPApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/mcp"
+    
+  MCPUserPolicyArn:
+    Description: IAM Policy ARN for MCP users (attach to users/roles that need access)
+    Value: !Ref MCPUserPolicy
+    Export:
+      Name: !Sub "${AWS::StackName}-MCPUserPolicy"

@@ -1,0 +1,177 @@
+You are an expert AWS support analyst. Your task is to analyze the following AWS support case annotation and determine the root cause category.
+
+Please analyze the case annotation and provide:
+1. RCA_Category: Choose one of ["Customer Question", "Limit reached", "Development Issue", "Customer Release", "Lack Monitoring", "Customer Dependency", "Throttling", "Feature Request", "Exceeding Capability", "Security Issue", "Transient Issues", "ICE Error", "Service Event", "AWS Release", "AWS Single Component Failure", "Upgrade Management"]
+2. RCA_Reason: A brief explanation of why you assigned this category
+
+Format your response as a single JSON object with these two fields only. Do not provide multiple JSON objects or examples - analyze the specific case and return only one JSON response.
+
+## Root Cause Category Definitions:
+- Customer Question: Customers escalating inquiries to critical severity levels due to urgency or time-sensitive requirements. These will be questions from the customer, there will not necessarily be an incident and you will see them requesting information.
+- Limit reached: Customers that were close to exceeding their service limits and needed them increasing urgently, typically due to insufficient capacity planning or load testing which meant a critical case was required to unblock. Support Engineers were not seeing throttling as a result of the limit being incorrectly set.
+- Development Issue: Architectural oversights during application development requiring guidance from support engineers on service reconfiguration. This is usually a miss-configuration or a lack of understanding on how multiple services integrate.
+- Customer Release: Production issues resulting from inadequate testing during the application release process. There will have been a change to the application that has been poorly tested which has led to the outage. It's clear that this has made it to production and that this could have been picked up with adequate testing.
+- Lack Monitoring: Incidents that could have been averted with proper monitoring mechanisms, such as alerts for volume capacity or health check failures that are not related to AWS service issues.
+- Customer Dependency: Issues acknowledged as originating from external dependencies, such as Lambda functions invoking on-premises APIs. The dependency lies somewhere on the customer network or may be the customer network directly.
+- Throttling: Workloads exceeding AWS service quotas, resulting in throttling, often due to inadequate performance testing in production environments. This throttling would have caused critical impact.
+- Feature Request: Where the customer is requesting an urgent feature or change they require.
+- Exceeding Capability: Support engineers recommending alternative services or architectural changes to accommodate workloads exceeding the capabilities of the current implementation.
+- Security Issue: Customers reporting security incidents, such as Distributed Denial of Service (DDoS) attacks, abuse, or potential vulnerabilities.
+- Transient Issues: Transient issues within AWS services or customer networks, exhibiting symptoms like service latency, with the root cause remaining unknown despite monitoring efforts, and the problem eventually resolving itself.
+- ICE Error: Workloads unable to scale due to capacity constraints within specific AWS Availability Zones.
+- Service Event: Caused by service impairment within AWS.
+- AWS Release: A latent bug or software release in an AWS service that has caused impact for our customer. Internal AWS service teams were required to fix the issue.
+- AWS Single Component Failure: Customers reporting downtime due to localized hardware failures within the AWS infrastructure, observed through their logging mechanisms. Service Team or Support Engineering need to step in to help resolve the issue or the support engineer points out that it was related to a hardware failure.
+- Upgrade Management: Customer has missed that an automated update has taken place to their managed service.
+
+Example 1:
+Case Summary: "The customer has an MLflow server stuck in 'creating' state that cannot be deleted or stopped, causing disruption to their workflow."
+
+{
+  "RCA_Category": "AWS Single Component Failure",
+  "RCA_Reason": "The MLflow server is stuck in a creating state, indicating a potential hardware or service component failure requiring AWS Support intervention"
+}
+
+Example 2:
+Case Summary: "The customer's DMS replication instance was stuck in a 'modifying' state for an extended period after updating storage and instance size, causing concern and potentially impacting their data migration process."
+
+{
+  "RCA_Category": "Customer Question",
+  "RCA_Reason": "The customer is inquiring about the expected behavior of a DMS replication instance during modification, without an actual incident occurring"
+}
+
+Example 3:
+Case Summary: "The customer was unable to create additional EBS io2 storage space due to hitting the maximum storage limit of 60 TiB in the us-east-1 region. This prevented them from building a server for critical infrastructure."
+
+{
+  "RCA_Category": "Limit reached",
+  "RCA_Reason": "The customer reached the default service quota for io2 storage and needed an urgent increase to continue their infrastructure deployment"
+}
+
+Example 4:
+Case Summary: "The customer's production EC2 instance was frequently failing status checks, showing 1/2 checks passed. This caused disruption to their production environment, requiring multiple server restarts."
+
+{
+  "RCA_Category": "Development Issue",
+  "RCA_Reason": "The instance had outdated ENA network drivers and NVMe drivers, indicating a configuration oversight in the customer's environment"
+}
+
+Example 5:
+Case Summary: "The customer accidentally deleted a secret for their RDS Oracle database using the 'forceDeleteWithoutRecovery' option, causing the secret to be permanently deleted."
+
+{
+  "RCA_Category": "Customer Release",
+  "RCA_Reason": "The customer made a change in production without proper testing or understanding of the forceDeleteWithoutRecovery option's implications"
+}
+
+Example 6:
+Case Summary: "The customer is experiencing degradation in EMR clusters, with steps failing due to Java Direct Memory errors related to the record server. This is causing disruptions in their ETL jobs and workflow."
+
+{
+  "RCA_Category": "Lack Monitoring",
+  "RCA_Reason": "The issue could have been detected earlier with proper monitoring of the EMR record server memory usage before it reached critical levels"
+}
+
+Example 7:
+Case Summary: "The customer is experiencing high latency (160ms) for DynamoDB operations in the us-west-2 region compared to us-east-1 (65ms), despite having similar table structure, data, and volume in both regions."
+
+{
+  "RCA_Category": "Customer Dependency",
+  "RCA_Reason": "The issue stems from network latency between the customer's application and the DynamoDB endpoint, not from the DynamoDB service itself"
+}
+
+Example 8:
+Case Summary: "The customer was experiencing model invocation request throttling when trying to invoke the Bedrock Claude 3.5 Sonnet V1 model. This was causing interruptions in their ability to use the model at their desired capacity."
+
+{
+  "RCA_Category": "Throttling",
+  "RCA_Reason": "The customer's workload exceeded the on-demand Requests Per Minute limit for the Bedrock model, resulting in throttling"
+}
+
+Example 9:
+Case Summary: "Customer is trying to use cloudwatch to surface up a metric that they could build an alarm on but it wasn't working as intended."
+
+{
+  "RCA_Category": "Feature Request",
+  "RCA_Reason": "The customer is requesting functionality that isn't currently supported in CloudWatch and needs to be submitted as a feature request"
+}
+
+Example 10:
+Case Summary: "The customer was experiencing load balancing issues at the CoreDNS level, where suddenly and randomly, CoreDNS request load would start getting processed only by one CoreDNS instance while the remaining ones decreased their load."
+
+{
+  "RCA_Category": "Exceeding Capability",
+  "RCA_Reason": "The T3 instance types used in the cluster nodes had limited network bandwidth that was being exceeded, requiring a change to instance types with higher capabilities"
+}
+
+Example 11:
+Case Summary: "The customer experienced a DDOS attack on their UK entity, causing potential service disruption and security concerns."
+
+{
+  "RCA_Category": "Security Issue",
+  "RCA_Reason": "The customer was experiencing a DDOS attack that was detected and mitigated by AWS Shield Advanced"
+}
+
+Example 12:
+Case Summary: "The customer is experiencing a shortage of g4dn.4xlarge GPU instances in all availability zones they have set up for their account. This is causing issues for their clients who need access to instances with GPUs."
+
+{
+  "RCA_Category": "ICE Error",
+  "RCA_Reason": "There is a capacity constraint for the requested GPU instances due to high demand, preventing the customer from launching the required resources"
+}
+
+Example 13:
+Case Summary: "The customer's team and customers were unable to complete login access to deployed services such as dashboards or APIs, severely impacting their operation. Several customers moved their traffic to other providers as a result."
+
+{
+  "RCA_Category": "Service Event",
+  "RCA_Reason": "There was an increased error rate for Amazon Cognito in the us-east-1 Region due to a change deployment, affecting multiple customers"
+}
+
+Example 14:
+Case Summary: "The customer's query, which used to work fine, started showing a 4-way join error since November, causing disruption to their data processing."
+
+{
+  "RCA_Category": "AWS Release",
+  "RCA_Reason": "A recent patch applied to the Redshift cluster introduced a problem with 4-way joins, causing previously working queries to fail"
+}
+
+Example 15:
+Case Summary: "The customer was unable to login to QuickSight in Production, affecting all users including the leadership team. This prevented access to business-critical reports and dashboards hosted on QuickSight."
+
+{
+  "RCA_Category": "Service Event",
+  "RCA_Reason": "There was a known issue with QuickSight authentication affecting IAM users with authentication directories in US-EAST-1 region"
+}
+
+Example 16:
+Case Summary: "The customer was unable to adjust schedules in their WFM system after a timezone change, causing a 1-hour difference in schedules compared to timestamps."
+
+{
+  "RCA_Category": "AWS Release",
+  "RCA_Reason": "The issue was caused by a frontend bug linked to the recent Daylight Saving Time change that required a fix from the AWS service team"
+}
+
+Example 17:
+Case Summary: "The customer's Karpenter controller pods in production were down for several hours and unable to be restored, causing disruption to their cluster's auto-scaling capabilities."
+
+{
+  "RCA_Category": "Exceeding Capability",
+  "RCA_Reason": "The Karpenter pods were experiencing high resource utilization that exceeded the available resources, requiring larger instance types"
+}
+
+Example 18:
+Case Summary: "The customer was experiencing issues with AWS DataSync tasks failing or not transferring all files. This was causing delays in transferring data for their client."
+
+{
+  "RCA_Category": "AWS Release",
+  "RCA_Reason": "There was an issue with DataSync's concurrent access to S3 that required AWS to make changes to better handle this type of workload"
+}
+
+Ensure that you only use categories that are defined within this prompt, do not create new ones, select the most appropriate root cause and select only one.
+
+IMPORTANT: Return only ONE JSON object for the case being analyzed. Do not return multiple JSON objects or examples.
+
+Now analyze the following case summary: {Case_Summary}
+
+Return your analysis as a single JSON object:

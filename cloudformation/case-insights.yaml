@@ -1,0 +1,1361 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Case Insights - A solution for gaining insights from AWS support cases using Generative AI. Includes optional analytics components (Athena, Glue) that can be enabled via the EnableAnalytics parameter for automated analytics setup.'
+
+Parameters:
+  UniqueIdentifier:
+    Type: String
+    Description: A unique identifier for the resources created by this template
+    AllowedPattern: '[a-z0-9-]+'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+    
+  OrganizationId:
+    Type: String
+    Description: The AWS Organization ID
+    
+  SupportRoleName:
+    Type: String
+    Description: The name of the role to assume in child accounts
+    Default: Support-Case-Analysis-Role
+    
+  BedrockModelId:
+    Type: String
+    Description: The Bedrock model ID to use for AI analysis
+    Default: anthropic.claude-3-haiku-20240307-v1:0
+    
+  BedrockMaxTokens:
+    Type: Number
+    Description: The maximum number of tokens to generate with Bedrock
+    Default: 1000
+    MinValue: 100
+    MaxValue: 4096
+    
+  LambdaMemorySize:
+    Type: Number
+    Description: The memory size for Lambda functions (in MB)
+    Default: 256
+    MinValue: 128
+    MaxValue: 10240
+    
+  LambdaTimeout:
+    Type: Number
+    Description: The timeout for Lambda functions (in seconds)
+    Default: 300
+    MinValue: 3
+    MaxValue: 900
+    
+  DeploymentTimestamp:
+    Type: String
+    Description: Timestamp to force Lambda function updates
+    Default: '2025-01-25-12-00-00'
+    
+  EnableAnalytics:
+    Type: String
+    Description: Enable automated analytics components (Athena database, table, and query results bucket). When enabled, automatically creates Athena database and external table for case insights data, along with necessary IAM roles for analytics integration. When disabled (default), maintains current behavior with manual analytics setup.
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    ConstraintDescription: Must be 'true' or 'false'
+
+Conditions:
+  # Conditional logic for analytics resources
+  # This condition determines whether to create optional analytics components (Athena, Glue)
+  # When EnableAnalytics parameter is 'true', all analytics resources will be created automatically
+  # When EnableAnalytics parameter is 'false' (default), no analytics resources are created (maintains backward compatibility)
+  CreateAnalyticsResources: !Equals [!Ref EnableAnalytics, 'true']
+
+Resources:
+  # S3 Buckets
+  AccountListBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: S3InvokeLambdaPermission
+    Properties:
+      BucketName: !Sub "s3-${UniqueIdentifier}-accountlist"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: active_aws_accounts.json
+            Function: !GetAtt AccountReaderFunction.Arn
+            
+  AccountListBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccountListBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-accountlist"
+              - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-accountlist/*"
+            Condition:
+              StringNotEquals:
+                aws:PrincipalAccount: !Ref AWS::AccountId
+                
+  CaseRawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "s3-${UniqueIdentifier}-caseraw"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  CaseProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "s3-${UniqueIdentifier}-caseprocessed"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            
+  CaseRawBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CaseRawBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-caseraw"
+              - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-caseraw/*"
+            Condition:
+              StringNotEquals:
+                aws:PrincipalAccount: !Ref AWS::AccountId
+
+  CaseProcessedBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CaseProcessedBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-caseprocessed"
+              - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-caseprocessed/*"
+            Condition:
+              StringNotEquals:
+                aws:PrincipalAccount: !Ref AWS::AccountId
+
+  AthenaQueryResultsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateAnalyticsResources
+    Properties:
+      BucketName: !Sub "s3-${UniqueIdentifier}-athena-results"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteQueryResults
+            Status: Enabled
+            ExpirationInDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  AthenaQueryResultsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateAnalyticsResources
+    Properties:
+      Bucket: !Ref AthenaQueryResultsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-athena-results"
+              - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-athena-results/*"
+            Condition:
+              StringNotEquals:
+                aws:PrincipalAccount: !Ref AWS::AccountId
+                
+  # SQS Queues
+  ActiveAccountsQueue:
+    Type: AWS::SQS::Queue
+    DependsOn: ActiveAccountsDLQ
+    Properties:
+      QueueName: SQS-ActiveAccounts
+      VisibilityTimeout: 420
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ActiveAccountsDLQ.Arn
+        maxReceiveCount: 5
+        
+  ActiveAccountsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: SQS-ActiveAccounts-DLQ
+      MessageRetentionPeriod: 1209600  # 14 days
+      
+  CaseAnnotationQueue:
+    Type: AWS::SQS::Queue
+    DependsOn: CaseAnnotationDLQ
+    Properties:
+      QueueName: SQS-CaseAnnotation
+      VisibilityTimeout: 420
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CaseAnnotationDLQ.Arn
+        maxReceiveCount: 5
+        
+  CaseAnnotationDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: SQS-CaseAnnotation-DLQ
+      MessageRetentionPeriod: 1209600  # 14 days
+      
+  CaseSummaryQueue:
+    Type: AWS::SQS::Queue
+    DependsOn: CaseSummaryDLQ
+    Properties:
+      QueueName: SQS-CaseSummary
+      VisibilityTimeout: 420
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CaseSummaryDLQ.Arn
+        maxReceiveCount: 5
+        
+  CaseSummaryDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: SQS-CaseSummary-DLQ
+      MessageRetentionPeriod: 1209600  # 14 days
+      
+  # IAM Roles
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "CaseInsights-LambdaExecutionRole-${UniqueIdentifier}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-accountlist"
+                  - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-accountlist/*"
+                  - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-caseraw"
+                  - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-caseraw/*"
+                  - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-caseprocessed"
+                  - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-caseprocessed/*"
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt ActiveAccountsQueue.Arn
+                  - !GetAtt CaseAnnotationQueue.Arn
+                  - !GetAtt CaseSummaryQueue.Arn
+        - PolicyName: STSAssumeRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:aws:iam::*:role/${SupportRoleName}"
+        - PolicyName: OrganizationsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:ListAccounts
+                Resource: "*"
+                
+  StartStepFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "CaseInsights-StartStepFunctionRole-${UniqueIdentifier}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StepFunctionExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                  - states:DescribeExecution
+                  - states:ListExecutions
+                Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:CaseAnalysis-${UniqueIdentifier}"
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt CaseSummaryQueue.Arn
+                
+  StepFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "CaseInsights-StepFunctionExecutionRole-${UniqueIdentifier}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:Step-CaseSummary-${UniqueIdentifier}"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:Step-RCAAnalysis-${UniqueIdentifier}"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:Step-LifecycleAnalysis-${UniqueIdentifier}"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:Step-UpdateCaseMetadata-${UniqueIdentifier}"
+                  
+  BedrockExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "CaseInsights-BedrockExecutionRole-${UniqueIdentifier}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-caseraw"
+                  - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-caseraw/*"
+                  - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-caseprocessed"
+                  - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-caseprocessed/*"
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:DeleteMessage
+                Resource:
+                  - !GetAtt CaseSummaryQueue.Arn
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+                
+  CaseCleanupExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "CaseInsights-CaseCleanupRole-${UniqueIdentifier}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-caseraw"
+                  - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-caseraw/*"
+                  - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-caseprocessed"
+                  - !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-caseprocessed/*"
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+                
+  # Lambda Functions
+  AccountLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "Lambda-AccountLookup-${UniqueIdentifier}"
+      Handler: app.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          ORGANIZATION_ID: !Ref OrganizationId
+          ACCOUNT_LIST_BUCKET: !Ref AccountListBucket
+      Code:
+        S3Bucket: <BucketName>
+        S3Key: account-lookup.zip
+              
+  AccountReaderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "Lambda-AccountReader-${UniqueIdentifier}"
+      Handler: app.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          ACTIVE_ACCOUNTS_QUEUE_URL: !Ref ActiveAccountsQueue
+      Code:
+        S3Bucket: <BucketName>
+        S3Key: account-reader.zip
+        
+  # Lambda Permission for S3 Bucket Notification
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AccountReaderFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub "arn:aws:s3:::s3-${UniqueIdentifier}-accountlist"
+              
+
+      
+  CaseRetrievalFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: 
+    - CaseRawBucket
+    - CaseAnnotationQueue
+    Properties:
+      FunctionName: !Sub "Lambda-CaseRetrieval-${UniqueIdentifier}"
+      Handler: app.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          CASE_RAW_BUCKET: !Ref CaseRawBucket
+          CASE_PROCESSED_BUCKET: !Ref CaseProcessedBucket
+          CASE_ANNOTATION_QUEUE_URL: !Ref CaseAnnotationQueue
+          SUPPORT_ROLE_NAME: !Ref SupportRoleName
+      Code:
+        S3Bucket: <BucketName>
+        S3Key: case-retrieval.zip
+      
+  CaseRetrievalEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn: 
+    - CaseRetrievalFunction
+    - ActiveAccountsQueue
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt ActiveAccountsQueue.Arn
+      FunctionName: !Ref CaseRetrievalFunction
+      
+  CaseAnnotationFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: 
+      - CaseRawBucket
+      - CaseSummaryQueue
+    Properties:
+      FunctionName: !Sub "Lambda-CaseAnnotation-${UniqueIdentifier}"
+      Handler: app.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          CASE_RAW_BUCKET: !Ref CaseRawBucket
+          CASE_SUMMARY_QUEUE_URL: !Ref CaseSummaryQueue
+          SUPPORT_ROLE_NAME: !Ref SupportRoleName
+      Code:
+        S3Bucket: <BucketName>
+        S3Key: case-annotation.zip
+      
+  CaseAnnotationEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn: 
+    - CaseAnnotationFunction
+    - CaseAnnotationQueue
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt CaseAnnotationQueue.Arn
+      FunctionName: !Ref CaseAnnotationFunction
+      
+  StartStepFunctionFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: 
+      - CaseAnalysisStateMachine
+      - StartStepFunctionExecutionRole
+    Properties:
+      FunctionName: !Sub "Lambda-StartStepFunction-${UniqueIdentifier}"
+      Handler: app.lambda_handler
+      Role: !GetAtt StartStepFunctionExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          CASE_ANALYSIS_STATE_MACHINE_ARN: !Ref CaseAnalysisStateMachine
+      Code:
+        S3Bucket: <BucketName>
+        S3Key: start-step-function.zip
+              
+  StartStepFunctionEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn: 
+    - StartStepFunctionFunction
+    - CaseSummaryQueue
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt CaseSummaryQueue.Arn
+      FunctionName: !Ref StartStepFunctionFunction
+      
+  CaseSummaryStepFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: TemplateLayer
+    Properties:
+      FunctionName: !Sub "Step-CaseSummary-${UniqueIdentifier}"
+      Handler: app.lambda_handler
+      Role: !GetAtt BedrockExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          BEDROCK_MAX_TOKENS: !Ref BedrockMaxTokens
+          SUMMARY_TEMPLATE_PATH: /opt/templates/summary-template.txt
+      Code:
+        S3Bucket: <BucketName>
+        S3Key: step-case-summary.zip
+      Layers:
+        - !Ref TemplateLayer
+              
+  RCAAnalysisStepFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: TemplateLayer
+    Properties:
+      FunctionName: !Sub "Step-RCAAnalysis-${UniqueIdentifier}"
+      Handler: app.lambda_handler
+      Role: !GetAtt BedrockExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          BEDROCK_MAX_TOKENS: !Ref BedrockMaxTokens
+          RCA_TEMPLATE_PATH: /opt/templates/rca-template.txt
+      Code:
+        S3Bucket: <BucketName>
+        S3Key: step-rca-analysis.zip
+      Layers:
+        - !Ref TemplateLayer
+              
+  LifecycleAnalysisStepFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: TemplateLayer
+    Properties:
+      FunctionName: !Sub "Step-LifecycleAnalysis-${UniqueIdentifier}"
+      Handler: app.lambda_handler
+      Role: !GetAtt BedrockExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          BEDROCK_MAX_TOKENS: !Ref BedrockMaxTokens
+          LIFECYCLE_TEMPLATE_PATH: /opt/templates/lifecycle-template.txt
+      Code:
+        S3Bucket: <BucketName>
+        S3Key: step-lifecycle-analysis.zip
+      Layers:
+        - !Ref TemplateLayer
+              
+  UpdateCaseMetadataStepFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "Step-UpdateCaseMetadata-${UniqueIdentifier}"
+      Handler: app.lambda_handler
+      Role: !GetAtt BedrockExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          CASE_SUMMARY_QUEUE_URL: !Ref CaseSummaryQueue
+          CASE_PROCESSED_BUCKET: !Ref CaseProcessedBucket
+      Code:
+        S3Bucket: <BucketName>
+        S3Key: step-update-case-metadata.zip
+        
+  CaseCleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "Lambda-CaseCleanup-${UniqueIdentifier}"
+      Handler: app.lambda_handler
+      Role: !GetAtt CaseCleanupExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 900  # 15 minutes for cleanup operations
+      MemorySize: 512  # More memory for processing large numbers of cases
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          CASE_RAW_BUCKET: !Ref CaseRawBucket
+          CASE_PROCESSED_BUCKET: !Ref CaseProcessedBucket
+          DRY_RUN: "false"
+          MAX_DELETIONS_PER_RUN: "1000"
+          EXCLUDED_ACCOUNTS: ""
+      Code:
+        S3Bucket: <BucketName>
+        S3Key: case-cleanup.zip
+              
+  # Step Function
+  CaseAnalysisStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn:
+    - CaseSummaryStepFunction
+    - RCAAnalysisStepFunction
+    - LifecycleAnalysisStepFunction
+    - UpdateCaseMetadataStepFunction
+    Properties:
+      StateMachineName: !Sub "CaseAnalysis-${UniqueIdentifier}"
+      RoleArn: !GetAtt StepFunctionExecutionRole.Arn
+      Definition:
+        Comment: "Case Analysis State Machine"
+        StartAt: CaseSummary
+        States:
+          CaseSummary:
+            Type: Task
+            Resource: !GetAtt CaseSummaryStepFunction.Arn
+            Next: RCAAnalysis
+            Retry:
+              - ErrorEquals: ["States.ALL"]
+                IntervalSeconds: 10
+                BackoffRate: 2.0
+                MaxAttempts: 5
+          RCAAnalysis:
+            Type: Task
+            Resource: !GetAtt RCAAnalysisStepFunction.Arn
+            Next: LifecycleAnalysis
+            Retry:
+              - ErrorEquals: ["States.ALL"]
+                IntervalSeconds: 10
+                BackoffRate: 2.0
+                MaxAttempts: 5
+          LifecycleAnalysis:
+            Type: Task
+            Resource: !GetAtt LifecycleAnalysisStepFunction.Arn
+            Next: UpdateCaseMetadata
+            Retry:
+              - ErrorEquals: ["States.ALL"]
+                IntervalSeconds: 10
+                BackoffRate: 2.0
+                MaxAttempts: 5
+          UpdateCaseMetadata:
+            Type: Task
+            Resource: !GetAtt UpdateCaseMetadataStepFunction.Arn
+            End: true
+            Retry:
+              - ErrorEquals: ["States.ALL"]
+                IntervalSeconds: 10
+                BackoffRate: 2.0
+                MaxAttempts: 5
+                
+  # CloudWatch Event Rule for daily account lookup
+  DailyAccountLookupRule:
+    Type: AWS::Events::Rule
+    DependsOn: AccountLookupFunction
+    Properties:
+      Name: !Sub "DailyAccountLookup-${UniqueIdentifier}"
+      Description: "Trigger the AccountLookup Lambda function daily"
+      ScheduleExpression: "cron(0 0 * * ? *)"  # Daily at midnight UTC
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AccountLookupFunction.Arn
+          Id: "AccountLookupTarget"
+          
+  DailyAccountLookupPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: 
+    - AccountLookupFunction
+    - DailyAccountLookupRule
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AccountLookupFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyAccountLookupRule.Arn
+      
+  # CloudWatch Event Rule for daily case cleanup
+  DailyCaseCleanupRule:
+    Type: AWS::Events::Rule
+    DependsOn: CaseCleanupFunction
+    Properties:
+      Name: !Sub "DailyCaseCleanup-${UniqueIdentifier}"
+      Description: "Trigger the CaseCleanup Lambda function daily"
+      ScheduleExpression: "cron(0 8 * * ? *)"  # Daily at 8:00 AM UTC
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CaseCleanupFunction.Arn
+          Id: "CaseCleanupTarget"
+          
+  DailyCaseCleanupPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: 
+    - CaseCleanupFunction
+    - DailyCaseCleanupRule
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CaseCleanupFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyCaseCleanupRule.Arn
+      
+  # CloudWatch Dashboard
+  CaseInsightsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "CaseInsights-${UniqueIdentifier}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 2,
+              "properties": {
+                "markdown": "# AWS Case Insights Dashboard\nMonitoring dashboard for the AWS Case Insights solution."
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 2,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${AccountLookupFunction}" ],
+                  [ ".", ".", ".", "${AccountReaderFunction}" ],
+                  [ ".", ".", ".", "${CaseRetrievalFunction}" ],
+                  [ ".", ".", ".", "${CaseAnnotationFunction}" ],
+                  [ ".", ".", ".", "${StartStepFunctionFunction}" ],
+                  [ ".", ".", ".", "${CaseCleanupFunction}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Invocations",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 2,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Errors", "FunctionName", "${AccountLookupFunction}" ],
+                  [ ".", ".", ".", "${AccountReaderFunction}" ],
+                  [ ".", ".", ".", "${CaseRetrievalFunction}" ],
+                  [ ".", ".", ".", "${CaseAnnotationFunction}" ],
+                  [ ".", ".", ".", "${StartStepFunctionFunction}" ],
+                  [ ".", ".", ".", "${CaseCleanupFunction}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Errors",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 2,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${AccountLookupFunction}" ],
+                  [ ".", ".", ".", "${AccountReaderFunction}" ],
+                  [ ".", ".", ".", "${CaseRetrievalFunction}" ],
+                  [ ".", ".", ".", "${CaseAnnotationFunction}" ],
+                  [ ".", ".", ".", "${StartStepFunctionFunction}" ],
+                  [ ".", ".", ".", "${CaseCleanupFunction}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Duration",
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 8,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SQS", "NumberOfMessagesReceived", "QueueName", "SQS-ActiveAccounts" ],
+                  [ ".", ".", ".", "SQS-CaseAnnotation" ],
+                  [ ".", ".", ".", "SQS-CaseSummary" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "SQS Messages Received",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 8,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "SQS-ActiveAccounts" ],
+                  [ ".", ".", ".", "SQS-CaseAnnotation" ],
+                  [ ".", ".", ".", "SQS-CaseSummary" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "SQS Queue Depth",
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 8,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/States", "ExecutionsStarted", "StateMachineArn", "${CaseAnalysisStateMachine}" ],
+                  [ ".", "ExecutionsSucceeded", ".", "." ],
+                  [ ".", "ExecutionsFailed", ".", "." ],
+                  [ ".", "ExecutionsTimedOut", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Step Function Executions",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 14,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "CaseInsights/Cleanup", "CasesScanned" ],
+                  [ ".", "CasesRemoved" ],
+                  [ ".", "AccountsProcessed" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Case Cleanup Metrics",
+                "period": 86400,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 14,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "CaseInsights/Cleanup", "Errors" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Case Cleanup Errors",
+                "period": 86400,
+                "stat": "Sum"
+              }
+            }
+          ]
+        }
+        
+  # CloudWatch Alarms
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "CaseInsights-LambdaErrors-${UniqueIdentifier}"
+      AlarmDescription: "Alarm when Lambda functions have errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CaseRetrievalFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      
+  StepFunctionFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "CaseInsights-StepFunctionFailures-${UniqueIdentifier}"
+      AlarmDescription: "Alarm when Step Functions fail"
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref CaseAnalysisStateMachine
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      
+  DLQMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "CaseInsights-DLQMessages-${UniqueIdentifier}"
+      AlarmDescription: "Alarm when messages are sent to DLQ"
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: SQS-ActiveAccounts-DLQ
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      
+  CaseCleanupErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "CaseInsights-CleanupErrors-${UniqueIdentifier}"
+      AlarmDescription: "Alarm when case cleanup encounters errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CaseCleanupFunction
+      Statistic: Sum
+      Period: 86400  # Daily period since cleanup runs daily
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  TemplateLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub "CaseInsights-Templates-${UniqueIdentifier}"
+      Description: !Sub "Layer containing templates for AI analysis - ${DeploymentTimestamp}"
+      Content:
+        S3Bucket: <BucketName>
+        S3Key: template-layer.zip
+      CompatibleRuntimes:
+        - python3.9
+
+  # ========================================
+  # OPTIONAL ANALYTICS RESOURCES
+  # ========================================
+  # The following resources are created only when EnableAnalytics parameter is set to 'true'
+  # These resources provide automated analytics setup for Athena queries
+  # When disabled (default), customers can still set up analytics manually using the documentation
+  
+  # Glue Database - Central catalog for case insights data
+  # Creates a database in AWS Glue Data Catalog that serves as the metadata repository
+  # for Athena queries and QuickSight data sources
+  CaseInsightsDatabase:
+    Type: AWS::Glue::Database
+    Condition: CreateAnalyticsResources  # Only created when analytics is enabled
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "case_insights_${UniqueIdentifier}"
+        Description: "Database for AWS Case Insights analytics - automated setup for Athena queries"
+        
+  # Glue External Table - Schema definition for case summary data
+  # Creates an external table that maps to JSON data stored in S3
+  # Enables Athena to query case data without moving or transforming it
+  # Includes all columns from case processing pipeline with AI analysis results
+  CaseInsightsTable:
+    Type: AWS::Glue::Table
+    Condition: CreateAnalyticsResources  # Only created when analytics is enabled
+    DependsOn: CaseInsightsDatabase      # Requires database to exist first
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CaseInsightsDatabase
+      TableInput:
+        Name: "case_summary"
+        Description: "External table for AWS Case Insights case summary data with AI analysis results"
+        TableType: "EXTERNAL_TABLE"
+        Parameters:
+          "classification": "json"
+          "compressionType": "none"
+          "typeOfData": "file"
+        StorageDescriptor:
+          # Column definitions match the JSON structure of case data stored in S3
+          # Each column represents a field from the case processing pipeline
+          Columns:
+            - Name: "caseId"
+              Type: "string"
+              Comment: "Unique case identifier"
+            - Name: "displayId"
+              Type: "string"
+              Comment: "Human-readable case display ID"
+            - Name: "subject"
+              Type: "string"
+              Comment: "Case subject line"
+            - Name: "serviceCode"
+              Type: "string"
+              Comment: "AWS service code for the case"
+            - Name: "categoryCode"
+              Type: "string"
+              Comment: "Case category classification"
+            - Name: "severityCode"
+              Type: "string"
+              Comment: "Case severity level"
+            - Name: "submittedBy"
+              Type: "string"
+              Comment: "User who submitted the case"
+            - Name: "timeCreated"
+              Type: "string"
+              Comment: "Case creation timestamp"
+            - Name: "Case_Retrieval_Date"
+              Type: "string"
+              Comment: "Date when case data was retrieved"
+            - Name: "Case_Summary"
+              Type: "string"
+              Comment: "AI-generated case summary"
+            - Name: "RCA_Category"
+              Type: "string"
+              Comment: "Root cause analysis category"
+            - Name: "RCA_Reason"
+              Type: "string"
+              Comment: "Root cause analysis detailed reason"
+            - Name: "RCA_Retrieval_Date"
+              Type: "string"
+              Comment: "Date when RCA analysis was performed"
+            - Name: "Lifecycle_Category"
+              Type: "string"
+              Comment: "Case lifecycle analysis category"
+            - Name: "Lifecycle_Reason"
+              Type: "string"
+              Comment: "Case lifecycle analysis detailed reason"
+            - Name: "Lifecycle_Retrieval_Date"
+              Type: "string"
+              Comment: "Date when lifecycle analysis was performed"
+          # S3 location where processed case data is stored (analytics-ready data)
+          Location: !Sub "s3://${CaseProcessedBucket}/"
+          # Input/Output formats for reading JSON files from S3
+          InputFormat: "org.apache.hadoop.mapred.TextInputFormat"
+          OutputFormat: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+          Compressed: false
+          # JSON SerDe configuration for parsing JSON data in S3
+          SerdeInfo:
+            SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe"
+            Parameters:
+              "serialization.format": "1"
+        # Partition keys for efficient querying - data is partitioned by account and case number
+        PartitionKeys:
+          - Name: "account_number"
+            Type: "string"
+            Comment: "AWS account number partition"
+          - Name: "case_number"
+            Type: "string"
+            Comment: "Case number partition"
+
+  # Athena WorkGroup - Isolated environment for running queries
+  # Provides query result location, cost controls, and monitoring
+  # Used by direct Athena queries and external analytics tools
+  CaseInsightsWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Condition: CreateAnalyticsResources  # Only created when analytics is enabled
+    DependsOn: AthenaQueryResultsBucket
+    Properties:
+      Name: !Sub "CaseInsights-${UniqueIdentifier}"
+      Description: "Workgroup for AWS Case Insights analytics queries"
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          # Dedicated S3 location for Athena query results
+          OutputLocation: !Sub "s3://${AthenaQueryResultsBucket}/"
+        # Enforce workgroup settings for all queries
+        EnforceWorkGroupConfiguration: true
+
+  # Glue Service Role - Required for Glue Crawler operations
+  # Provides necessary permissions to access S3 data and update Glue Data Catalog
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Condition: CreateAnalyticsResources  # Only created when analytics is enabled
+    Properties:
+      RoleName: !Sub "CaseInsights-GlueServiceRole-${UniqueIdentifier}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${CaseProcessedBucket}"
+                  - !Sub "arn:aws:s3:::${CaseProcessedBucket}/*"
+
+  # Glue Crawler - Automatically discovers new partitions in S3 data
+  # Runs daily to detect new account_number/case_number partitions
+  # Updates Glue Data Catalog metadata for Athena queries
+  CaseInsightsPartitionCrawler:
+    Type: AWS::Glue::Crawler
+    Condition: CreateAnalyticsResources  # Only created when analytics is enabled
+    DependsOn: 
+      - CaseInsightsTable
+      - GlueServiceRole
+    Properties:
+      Name: !Sub "case-insights-partition-crawler-${UniqueIdentifier}"
+      Description: "Crawler to automatically discover new partitions in case insights data"
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref CaseInsightsDatabase
+      SchemaChangePolicy:
+        UpdateBehavior: "UPDATE_IN_DATABASE"
+        DeleteBehavior: "LOG"
+      Configuration: |
+        {
+          "Version": 1.0,
+          "Grouping": {
+            "TableGroupingPolicy": "CombineCompatibleSchemas"
+          },
+          "CrawlerOutput": {
+            "Partitions": { "AddOrUpdateBehavior": "InheritFromTable" },
+            "Tables": { "AddOrUpdateBehavior": "MergeNewColumns" }
+          }
+        }
+      Targets:
+        CatalogTargets:
+          - DatabaseName: !Ref CaseInsightsDatabase
+            Tables: 
+              - "case_summary"
+      # Run daily at 9 AM UTC to discover new partitions
+      Schedule:
+        ScheduleExpression: "cron(0 9 * * ? *)"
+
+Outputs:
+  AccountListBucket:
+    Description: The S3 bucket for storing account lists
+    Value: !Ref AccountListBucket
+    
+  CaseRawBucket:
+    Description: The S3 bucket for storing raw case data
+    Value: !Ref CaseRawBucket
+    
+  CaseProcessedBucket:
+    Description: The S3 bucket for storing processed case data
+    Value: !Ref CaseProcessedBucket
+    
+  ActiveAccountsQueue:
+    Description: The SQS queue for active accounts
+    Value: !Ref ActiveAccountsQueue
+    
+  CaseAnnotationQueue:
+    Description: The SQS queue for case annotations
+    Value: !Ref CaseAnnotationQueue
+    
+  CaseSummaryQueue:
+    Description: The SQS queue for case summaries
+    Value: !Ref CaseSummaryQueue
+    
+  CaseAnalysisStateMachine:
+    Description: The Step Function for case analysis
+    Value: !Ref CaseAnalysisStateMachine
+    
+  Dashboard:
+    Description: The CloudWatch dashboard for monitoring
+    Value: !Sub "https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${CaseInsightsDashboard}"
+    
+  # Analytics Configuration Output
+  # Always available to indicate whether analytics components were deployed
+  AnalyticsEnabled:
+    Description: Whether analytics components are enabled
+    Value: !Ref EnableAnalytics
+    Export:
+      Name: !Sub "${AWS::StackName}-AnalyticsEnabled"
+
+  # ========================================
+  # CONDITIONAL ANALYTICS OUTPUTS
+  # ========================================
+  # The following outputs are only available when EnableAnalytics is 'true'
+  # These provide resource names and ARNs for integration with external tools
+
+  # Athena Database Name - for manual queries and external integrations
+  AthenaDatabaseName:
+    Condition: CreateAnalyticsResources  # Only output when analytics is enabled
+    Description: Name of the Athena database for case insights
+    Value: !Ref CaseInsightsDatabase
+    Export:
+      Name: !Sub "${AWS::StackName}-AthenaDatabaseName"
+
+  # Athena Table Name - for direct table access and MSCK REPAIR operations
+  AthenaTableName:
+    Condition: CreateAnalyticsResources  # Only output when analytics is enabled
+    Description: Name of the Athena table for case summary data
+    Value: !Ref CaseInsightsTable
+    Export:
+      Name: !Sub "${AWS::StackName}-AthenaTableName"
+
+  # Athena WorkGroup Name - for query isolation and cost management
+  AthenaWorkGroupName:
+    Condition: CreateAnalyticsResources  # Only output when analytics is enabled
+    Description: Name of the Athena workgroup
+    Value: !Ref CaseInsightsWorkGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-AthenaWorkGroupName"
+
+  # Athena Query Results Bucket - for storing Athena query outputs
+  AthenaQueryResultsBucket:
+    Condition: CreateAnalyticsResources  # Only output when analytics is enabled
+    Description: S3 bucket for storing Athena query results
+    Value: !Ref AthenaQueryResultsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-AthenaQueryResultsBucket"
+
+  # Glue Crawler Name - for managing partition discovery
+  GlueCrawlerName:
+    Condition: CreateAnalyticsResources  # Only output when analytics is enabled
+    Description: Name of the Glue crawler for automatic partition discovery
+    Value: !Ref CaseInsightsPartitionCrawler
+    Export:
+      Name: !Sub "${AWS::StackName}-GlueCrawlerName"

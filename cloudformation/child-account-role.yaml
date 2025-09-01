@@ -1,0 +1,47 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Case Insights - Support Case Analysis Role for Child Accounts'
+
+Parameters:
+  ManagementAccountId:
+    Type: String
+    Description: The AWS account ID of the management account where the Case Insights solution is deployed
+    
+  RoleName:
+    Type: String
+    Description: The name of the role to create
+    Default: Support-Case-Analysis-Role
+    
+  OrganizationId:
+    Type: String
+    Description: The AWS Organization ID
+
+Resources:
+  SupportCaseAnalysisRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${ManagementAccountId}:root"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganizationId
+      Policies:
+        - PolicyName: SupportCaseAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - support:DescribeCases
+                  - support:DescribeCommunications
+                Resource: "*"
+
+Outputs:
+  RoleARN:
+    Description: The ARN of the created role
+    Value: !GetAtt SupportCaseAnalysisRole.Arn

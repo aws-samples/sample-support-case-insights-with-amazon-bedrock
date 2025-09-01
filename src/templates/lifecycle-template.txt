@@ -1,0 +1,117 @@
+You are an expert AWS support analyst. Your task is to analyze the following AWS support case annotation and determine the lifecycle category.
+
+Please analyze the case annotation and provide:
+1. Lifecycle_Category: Choose one of ["Anomaly Detection", "Alarming", "AB Testing", "Architecture", "Backup/DR", "CICD", "Code Review", "Dependency Mapping", "Event Management", "Load Testing", "Logging", "Monitoring", "Performance Benchmarking", "Resilience", "Run Books", "Training", "Fault Injection and GameDay", "Ops Reviews", "Tracing", "Risk Evaluation"]
+2. Lifecycle_Reason: A brief explanation of why you assigned this category
+
+Format your response as a single JSON object with these two fields only. Do not provide multiple JSON objects or examples - analyze the specific case and return only one JSON response.
+
+## Lifecycle Category Definitions:
+- Anomaly Detection: An issue that should have been picked up by Anomaly Detection. This is where a customer identifies a solid trend such as the fill rate in a log and the rate starts to increase rapidly and wouldn't have been picked up by traditional threshold monitoring. Anomaly detection is designed to give early indication that a problem might be occuring before a threshold is breached.
+- Alarming: Improving of customer alarms could have helped prevent the impact seen by the customer. Usually this could be a threshold that was missed or too high that the impact occurred before it was picked up by an operations team.
+- AB Testing: This is essential testing where two versions of an application are shown to a user base, you slowly introduce the new version and over time cut over if all tests pass successfully and no alarms trigger. This prevents major impact from a release. A sign of this could be that a customer deployed a new version of their application to their full production environment and needed help reverting.
+- Architecture: There's something wrong with the architecture, could be that the service isn't suitable or poorly designed. An example os this would be using a single instance within an AZ to host a fileshare instead of choosing FSx or S3.
+- Backup/DR: There was a lack of backup or DR strategy or it was poorly executed which led to the incident. If the customer had designed their disaster strategy properly the recovery would have been seemless.
+- CICD: A defect slipped through the CI/CD pipeline. Usually there will have been a change on the customer end that wasn't tested properly. If they implemented automated testing and delivery through a pipeline the problem could have been avoided.
+- Code Review: We feel that the defect could have been picked up during a code review, before the code was compiled and fed through the pipeline towards an actual environment.
+- Dependency Mapping: Something outside of AWS or another AWS account has gone wrong which has had an impact upon the customer workload. Customers take dependancies on many IT services both within AWS and on their own network, if they don't properly monitor these dependancies then errors can occur.
+- Event Management: This would be identified as poor event management processes leading to a larger outage. They may also have not known about an AWS service event which would indicate they're not monitoring Personal Health Dashboard and dealing with AWS events.
+- Load Testing: Load based testing should have picked up the issue that's being raised. An example of this would be volumes without enough throughput. Applications should be tested with peak expected scale and then these tests repeated often to ensure that the customer application is capable of handling these volumes.
+- Logging: If customers are struggling to track down the source of an issue it's usuallybecause applications aren't logging properly and the correct alarms have not been put in place based on errors within these logs. An example of this is an application has login issues and the customer does not know if this is related to their application or authentication service. With proper logging they would be able to see that this was related to their user database experiencing errors.
+- Monitoring: The issue wasn't picked up by customer monitoring which emans it grew into a larger outage.
+- Performance Benchmarking: Performance benchmarking is used to compare the performance you expect against other systems and what you expected during your load based testing. If you don't evaluate your performance you have no idea whether the performance you're seeing is suitable for your workload.
+- Resilience: A single AZ issue caused an outage to the service. You're looking for signs that the service may have not been designed with resiliency in mind. An example of this is uneven EC2 distribution across Azs, during a failure of an AZ it's possible that the customer may not be able to meet their customer demand.
+- Run Books: There's clear evidence that there are poor runbooks for this service and that the customer didn't have well defined procedures to follow in the event that a known alarm triggered.
+- Training: There appears to have been a lack of understanding around the service capabilities or functionality. An example of this could be asking questions around a service and the way that it works.
+- Fault Injection and GameDay: This is where you use services like FIS (Fault Injection Service) to simulate failures to your environment or where you have a gameday before going to full production where you have two teams compete to bring down the service and keep it alive.
+- Ops Reviews: Customers should be doing an operations review on their estate at regular intervals. Customers may evaluate their ticket data, look to automate manual steps in their run books and look for gaps in their operational procedures.
+- Tracing: Tracing is primarily used for anomaly detection, fault analysis, debugging or diagnostic purposes in distributed software systems, such as microservices or serverless functions. It allows an operator to identify bring the logs together from multiple components and visualise what was happening across the system at the time of the event.
+- Risk Evaluation: Risk evaluation is where a customer looks at the likelyhood of a risk occuring vs the cost of remediation. They perform a calculation and then either invest to remediate an issue or accept the outage when it occurs. An example of this could be a poor risk decision, the customer decided not to upgrade their version of Lambda runtime and it ended in an outage. You can see our support engineers recommending newer versions of software to the customer.
+
+Example 1:
+Case Summary: "Customer was experiencing a jump in 503 errors for their application."
+
+{
+  "Lifecycle_Category": "Anomaly Detection",
+  "Lifecycle_Reason": "The customer could have implemented anomaly detection to identify the abnormal increase in 503 errors before it became a critical issue"
+}
+
+Example 2:
+Case Summary: "Customers application was not responding and additional latency was appearing in the customer side of the application."
+
+{
+  "Lifecycle_Category": "Alarming",
+  "Lifecycle_Reason": "The customer was not tracking the number of retries for the application and hadn't built any alarms to detect increasing failure rates"
+}
+
+Example 3:
+Case Summary: "The customer experienced zero traffic from ELB to AZ since 00 UTC, causing critical breaches in ELB to AZ Target response time per minute across all three availability zones."
+
+{
+  "Lifecycle_Category": "AB Testing",
+  "Lifecycle_Reason": "If the customer had performed the change on only a small number of instances they would have noticed the handshake problem and could have reversed the change"
+}
+
+Example 4:
+Case Summary: "A DMS task is stuck in 'Starting' mode for six hours, preventing the migration of data from legacy BI systems to Redshift."
+
+{
+  "Lifecycle_Category": "Architecture",
+  "Lifecycle_Reason": "The issue was caused by memory contention due to insufficient resources, indicating a need for architectural improvements"
+}
+
+Example 5:
+Case Summary: "Customers main application was brought offline by a service event. The service event had an unknown duration and the customer was complaining that they were unable to service their customer demand."
+
+{
+  "Lifecycle_Category": "Backup/DR",
+  "Lifecycle_Reason": "The customer did not have a disaster recovery plan to maintain service availability during the AWS service event"
+}
+
+Example 6:
+Case Summary: "The customer was unable to ingest any records into their Feature Groups for three days, causing their endpoint to fail."
+
+{
+  "Lifecycle_Category": "CICD",
+  "Lifecycle_Reason": "The security group misconfiguration could have been caught by implementing checks and tests in the CI/CD pipeline"
+}
+
+Example 7:
+Case Summary: "The customer was experiencing connectivity issues after restoring a database named 'dfly-cc-inssuite-prod-encrypted' from an original database."
+
+{
+  "Lifecycle_Category": "Code Review",
+  "Lifecycle_Reason": "A thorough code review could have identified the security group misconfiguration before deployment"
+}
+
+Example 8:
+Case Summary: "GPU nodes in the EKS cluster were unable to scale and were in Not Ready status, causing the application to be down during peak volumes."
+
+{
+  "Lifecycle_Category": "Dependency Mapping",
+  "Lifecycle_Reason": "The EKS environment was dependent on an AMI created by a third-party team, highlighting the need for better dependency management"
+}
+
+Example 9:
+Case Summary: "The customer experienced a Glue job failure that was not updating their DynamoDB table. This caused issues with their data processing workflow."
+
+{
+  "Lifecycle_Category": "Event Management",
+  "Lifecycle_Reason": "The customer was not aware of the Glue service issue, suggesting they weren't monitoring Personal Health Dashboard notifications"
+}
+
+Example 10:
+Case Summary: "The customer was experiencing load balancing issues at the CoreDNS level, where suddenly and randomly, CoreDNS request load would start getting processed only by one CoreDNS instance."
+
+{
+  "Lifecycle_Category": "Load Testing",
+  "Lifecycle_Reason": "The incorrect instance size was selected, indicating that no load testing had been completed to validate the resource requirements"
+}
+
+Ensure that you only use categories that are defined within this prompt, do not create new ones, select the most appropriate root cause and select only one.
+
+IMPORTANT: Return only ONE JSON object for the case being analyzed. Do not return multiple JSON objects or examples.
+
+Now analyze the following case summary: {Case_Summary}
+
+Return your analysis as a single JSON object:
