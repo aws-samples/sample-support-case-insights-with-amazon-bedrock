@@ -213,7 +213,7 @@ Your IAM user or role needs the following permission to enable Bedrock models:
 2. **Request Model Access**:
    - Click **"Manage model access"** or **"Model access"** in the left navigation
    - Find **"Anthropic Claude"** models in the list
-   - Select **"Claude 3 Haiku"** (recommended default)
+   - Select **"Claude 3.5 Haiku"** (recommended default)
    - Optionally select **"Claude 3.5 Sonnet"** for higher quality analysis
    - Click **"Request model access"** or **"Save changes"**
 
@@ -235,7 +235,7 @@ aws bedrock list-foundation-models --region <your-region> \
 
 **Expected output should include:**
 ```
-|  anthropic.claude-3-haiku-20240307-v1:0     |  Claude 3 Haiku     |
+|  anthropic.claude-3-5-haiku-20241022-v1:0     |  Claude 3.5 Haiku     |
 |  anthropic.claude-3-5-sonnet-20240620-v1:0  |  Claude 3.5 Sonnet  |
 ```
 
@@ -271,7 +271,7 @@ The solution has been tested with these Anthropic Claude models:
 
 | Model | Model ID | Performance | Cost | Notes |
 |-------|----------|-------------|------|-------|
-| **Claude 3 Haiku** ⭐ **DEFAULT** | `anthropic.claude-3-haiku-20240307-v1:0` | Fast | Low | Recommended for cost efficiency |
+| **Claude 3.5 Haiku** ⭐ **DEFAULT** | `anthropic.claude-3-5-haiku-20241022-v1:0` | Fast | Low | Recommended for cost efficiency |
 | **Claude 3.5 Sonnet** | `anthropic.claude-3-5-sonnet-20240620-v1:0` | High Quality | Higher | Best analysis quality |
 
 ## Step 2: Package Lambda Functions
