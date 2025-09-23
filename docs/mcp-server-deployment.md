@@ -417,6 +417,362 @@ The server supports both **REST API** and **MCP Protocol** interfaces:
 - **Endpoints**: `https://your-endpoint/tools/*`
 - **Methods**: GET, POST
 
+## Why a Client Wrapper is Required
+
+**Important**: The MCP server runs on AWS API Gateway, which uses **HTTP REST endpoints**. However, MCP clients (like Kiro) expect tools to communicate via **stdin/stdout using JSON-RPC protocol**.
+
+### Protocol Translation Challenge
+```
+MCP Client (Kiro) ↔ stdin/stdout JSON-RPC ↔ [WRAPPER NEEDED] ↔ HTTP REST ↔ AWS API Gateway
+```
+
+The `mcp_aws_client.py` wrapper bridges this gap by:
+- **Protocol Translation**: Converting stdin/stdout ↔ HTTP REST requests
+- **AWS Authentication**: Handling AWS SigV4 authentication automatically  
+- **Format Conversion**: Translating MCP JSON-RPC to API Gateway format
+- **Credential Management**: Supporting multiple AWS credential sources
+
+Without this wrapper, MCP clients cannot communicate with the AWS-hosted MCP server.
+
+## MCP Client Wrapper Setup
+
+### Download the Client Wrapper
+
+Create the required client wrapper file in your project directory:
+
+**Copy the code directly**
+
+Save the following code as `mcp_aws_client.py` in your project directory:
+
+```python
+#!/usr/bin/env python3
+"""
+AWS Case Insights MCP Server
+Implements proper MCP protocol with AWS SigV4 authentication
+"""
+
+import json
+import sys
+import os
+import boto3
+import requests
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
+from botocore.credentials import InstanceMetadataProvider, EnvProvider, SharedCredentialProvider, ContainerProvider
+from botocore.session import get_session
+
+# MCP Protocol constants
+MCP_VERSION = "2024-11-05"
+
+class MCPServer:
+    def __init__(self, mcp_url, aws_region):
+        self.mcp_url = mcp_url
+        self.aws_region = aws_region
+        self.credentials = None
+        self.initialized = False
+        
+    def setup_credentials(self):
+        """Set up AWS credentials from various sources"""
+        credential_source = "unknown"
+        
+        # Method 1: Try environment variables first
+        if os.environ.get('AWS_ACCESS_KEY_ID') and os.environ.get('AWS_SECRET_ACCESS_KEY'):
+            session = boto3.Session(
+                aws_access_key_id=os.environ.get('AWS_ACCESS_KEY_ID'),
+                aws_secret_access_key=os.environ.get('AWS_SECRET_ACCESS_KEY'),
+                aws_session_token=os.environ.get('AWS_SESSION_TOKEN'),
+                region_name=self.aws_region
+            )
+            self.credentials = session.get_credentials()
+            credential_source = "environment variables"
+        
+        # Method 2: Try AWS CLI profile/config files
+        if not self.credentials:
+            try:
+                session = boto3.Session(region_name=self.aws_region)
+                self.credentials = session.get_credentials()
+                if self.credentials:
+                    credential_source = "AWS CLI profile/config"
+            except Exception:
+                pass
+        
+        # Method 3: Try instance metadata (for EC2/ECS)
+        if not self.credentials:
+            try:
+                botocore_session = get_session()
+                instance_provider = InstanceMetadataProvider(botocore_session)
+                self.credentials = instance_provider.load()
+                if self.credentials:
+                    credential_source = "instance metadata"
+            except Exception:
+                pass
+        
+        # Method 4: Try container credentials (for ECS tasks)
+        if not self.credentials:
+            try:
+                botocore_session = get_session()
+                container_provider = ContainerProvider(botocore_session)
+                self.credentials = container_provider.load()
+                if self.credentials:
+                    credential_source = "container credentials"
+            except Exception:
+                pass
+        
+        if not self.credentials:
+            raise Exception("AWS credentials not found. Please configure AWS CLI or set environment variables.")
+        
+        print(f"Using AWS credentials from: {credential_source}", file=sys.stderr)
+        
+    def handle_initialize(self, request_id, params):
+        """Handle MCP initialize request"""
+        self.initialized = True
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "protocolVersion": MCP_VERSION,
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "aws-case-insights",
+                    "version": "1.0.0"
+                }
+            }
+        }
+    
+    def handle_tools_list(self, request_id):
+        """Handle tools/list request by forwarding to HTTP MCP server"""
+        try:
+            # Forward request to HTTP MCP server
+            data = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/list",
+                "params": {}
+            }
+            
+            request = AWSRequest(
+                method='POST',
+                url=f"{self.mcp_url}/mcp",
+                data=json.dumps(data),
+                headers={'Content-Type': 'application/json'}
+            )
+            
+            SigV4Auth(self.credentials, 'execute-api', self.aws_region).add_auth(request)
+            
+            response = requests.post(
+                request.url,
+                data=request.body,
+                headers=dict(request.headers),
+                timeout=30
+            )
+            
+            return response.json()
+            
+        except Exception as e:
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": f"Internal error: {str(e)}"
+                }
+            }
+    
+    def handle_tools_call(self, request_id, params):
+        """Handle tools/call request by forwarding to HTTP MCP server"""
+        try:
+            # Forward request to HTTP MCP server
+            data = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": params
+            }
+            
+            request = AWSRequest(
+                method='POST',
+                url=f"{self.mcp_url}/mcp",
+                data=json.dumps(data),
+                headers={'Content-Type': 'application/json'}
+            )
+            
+            SigV4Auth(self.credentials, 'execute-api', self.aws_region).add_auth(request)
+            
+            response = requests.post(
+                request.url,
+                data=request.body,
+                headers=dict(request.headers),
+                timeout=30
+            )
+            
+            return response.json()
+            
+        except Exception as e:
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": f"Internal error: {str(e)}"
+                }
+            }
+    
+    def handle_request(self, request_data):
+        """Handle incoming MCP request"""
+        try:
+            method = request_data.get('method')
+            request_id = request_data.get('id')
+            params = request_data.get('params', {})
+            
+            if method == 'initialize':
+                return self.handle_initialize(request_id, params)
+            elif method == 'tools/list':
+                if not self.initialized:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {
+                            "code": -32002,
+                            "message": "Server not initialized"
+                        }
+                    }
+                return self.handle_tools_list(request_id)
+            elif method == 'tools/call':
+                if not self.initialized:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {
+                            "code": -32002,
+                            "message": "Server not initialized"
+                        }
+                    }
+                return self.handle_tools_call(request_id, params)
+            else:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32601,
+                        "message": f"Method not found: {method}"
+                    }
+                }
+                
+        except Exception as e:
+            return {
+                "jsonrpc": "2.0",
+                "id": request_data.get('id'),
+                "error": {
+                    "code": -32603,
+                    "message": f"Internal error: {str(e)}"
+                }
+            }
+
+def main():
+    # Get MCP server URL from environment
+    mcp_url = os.environ.get('MCP_SERVER_URL')
+    if not mcp_url:
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32000,
+                "message": "MCP_SERVER_URL environment variable not set"
+            }
+        }))
+        sys.exit(1)
+    
+    # Get AWS region
+    aws_region = os.environ.get('AWS_REGION', 'us-east-1')
+    
+    # Create MCP server instance
+    server = MCPServer(mcp_url, aws_region)
+    
+    try:
+        # Set up AWS credentials
+        server.setup_credentials()
+        
+        # Read MCP requests from stdin and process them
+        try:
+            for line in sys.stdin:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                try:
+                    # Parse MCP request
+                    request_data = json.loads(line)
+                    
+                    # Handle the request
+                    response = server.handle_request(request_data)
+                    
+                    # Send response
+                    print(json.dumps(response))
+                    sys.stdout.flush()
+                    
+                except json.JSONDecodeError as e:
+                    error_response = {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {
+                            "code": -32700,
+                            "message": f"Parse error: {str(e)}"
+                        }
+                    }
+                    print(json.dumps(error_response))
+                    sys.stdout.flush()
+                except Exception as e:
+                    error_response = {
+                        "jsonrpc": "2.0",
+                        "id": None,
+                        "error": {
+                            "code": -32603,
+                            "message": f"Internal error: {str(e)}"
+                        }
+                    }
+                    print(json.dumps(error_response))
+                    sys.stdout.flush()
+                
+        except EOFError:
+            # End of input, exit gracefully
+            pass
+        except KeyboardInterrupt:
+            # Handle Ctrl+C gracefully
+            pass
+                
+    except Exception as e:
+        error_response = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": -32000,
+                "message": f"Failed to initialize: {str(e)}"
+            }
+        }
+        print(json.dumps(error_response))
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+```
+
+
+### Install Required Dependencies
+
+The client wrapper requires these Python packages:
+
+```bash
+pip install boto3 requests botocore
+```
+
+### Make the Script Executable
+
+```bash
+chmod +x mcp_aws_client.py
+```
+
 ## Testing the MCP Server
 
 ### Authentication Requirements
@@ -655,100 +1011,71 @@ awscurl -X POST $ENDPOINT/tools/analyze_case_summaries \
      --output table
    ```
 
-2. **Configure MCP in Kiro**:
+2. **Setup the Client Wrapper**:
    
-   Create or update `.kiro/settings/mcp.json` with your actual endpoint URL:
-   
-   ```json
-   {
-     "mcpServers": {
-       "case-insights": {
-         "command": "uvx",
-         "args": ["mcp-server-http", "--url", "YOUR_ENDPOINT_URL_HERE"],
-         "env": {
-           "MCP_SERVER_URL": "YOUR_ENDPOINT_URL_HERE"
-         },
-         "disabled": false,
-         "autoApprove": ["get_case_summary", "get_service_trends"]
-       }
-     }
-   }
-   ```
-   
-   **Example with actual URL**:
-   ```json
-   {
-     "mcpServers": {
-       "case-insights": {
-         "command": "uvx",
-         "args": ["mcp-server-http", "--url", "https://abc123def4.execute-api.us-east-1.amazonaws.com/prod"],
-         "env": {
-           "MCP_SERVER_URL": "https://abc123def4.execute-api.us-east-1.amazonaws.com/prod"
-         },
-         "disabled": false,
-         "autoApprove": ["get_case_summary", "get_service_trends", "analyze_case_summaries"]
-       }
-     }
-   }
-   ```
+   First, ensure you have the `mcp_aws_client.py` file in your project directory wihch you created earlier (see the "MCP Client Wrapper Setup" section above).
 
-   **Alternative: Direct HTTP MCP Client** (if mcp-server-http is not available):
-   ```json
-   {
-     "mcpServers": {
-       "case-insights": {
-         "command": "python",
-         "args": ["-c", "import requests; import json; import sys; url=sys.argv[1]; data=json.load(sys.stdin); print(json.dumps(requests.post(f'{url}/mcp', json=data).json()))", "YOUR_ENDPOINT_URL_HERE"],
-         "disabled": false,
-         "autoApprove": ["get_case_summary", "get_service_trends"]
-       }
-     }
-   }
-   ```
+3. **Configure MCP in Kiro**:
+   
+   Create or update `.kiro/settings/mcp.json` in your project workspace with your actual endpoint URL:
 
-3. **Complete Setup Script**:
-   
-   Here's a complete script to get your URL and create the Kiro configuration:
-   
-   ```bash
-   #!/bin/bash
-   
-   # Get the MCP server endpoint
-   ENDPOINT=$(aws cloudformation describe-stacks \
-     --stack-name mcp-case-insights \
-     --query 'Stacks[0].Outputs[?OutputKey==`MCPServerEndpoint`].OutputValue' \
-     --output text)
-   
-   if [ -z "$ENDPOINT" ]; then
-     echo "Error: Could not retrieve MCP server endpoint. Check your stack name."
-     exit 1
-   fi
-   
-   echo "Found MCP Server URL: $ENDPOINT"
-   
-   # Create .kiro directory if it doesn't exist
-   mkdir -p .kiro/settings
-   
-   # Create the MCP configuration
-   cat > .kiro/settings/mcp.json << EOF
-   {
-     "mcpServers": {
-       "case-insights": {
-         "command": "uvx",
-         "args": ["mcp-server-http", "--url", "$ENDPOINT"],
-         "env": {
-           "MCP_SERVER_URL": "$ENDPOINT"
-         },
-         "disabled": false,
-         "autoApprove": ["get_case_summary", "get_service_trends", "analyze_case_summaries"]
-       }
-     }
-   }
-   EOF
-   
-   echo "Created .kiro/settings/mcp.json with your MCP server configuration"
-   echo "You can now use the Case Insights MCP tools in Kiro!"
-   ```
+   ```json
+    {
+      "mcpServers": {
+        "aws-case-insights": {
+          "command": "/<path to kiro environment>/.kiro/start_mcp_server.sh",
+          "args": [],
+          "env": {
+            "MCP_SERVER_URL": "<Your URL Endpoint from APIGW>",
+            "AWS_REGION": "us-east-1"
+          },
+          "disabled": false,
+          "autoApprove": [
+            "get_case_summary",
+            "get_service_trends",
+            "get_rca_analysis",
+            "query_athena",
+            "analyze_with_bedrock",
+            "analyze_case_summaries"
+          ]
+        }
+      }
+    }
+  ```
+  
+  Create a wrapper script for starting the MCP and save as start_mcp_server.sh within your workspace:
+
+  ```bash
+  #!/bin/bash
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Set environment variables
+export MCP_SERVER_URL="${MCP_SERVER_URL:-https://<APIGW URL>/v1}"
+export AWS_REGION="${AWS_REGION:-us-east-1}"
+
+# Execute the Python MCP server
+exec "$SCRIPT_DIR/mcp_venv/bin/python" "$SCRIPT_DIR/mcp_aws_client.py" "$@"
+```
+NOTE:  Remember to replace the APIGW URL with your URL.
+
+Restart Kiro, you will get an error that the MCP server could not start, this is credential related. 
+
+Before moving onto testing, make sure that credentials have been added to environmental variables and then to the aws credentials file by running:
+
+```bash
+cat > ~/.aws/credentials << EOF
+[default]
+aws_access_key_id = $AWS_ACCESS_KEY_ID
+aws_secret_access_key = $AWS_SECRET_ACCESS_KEY
+aws_session_token = $AWS_SESSION_TOKEN
+EOF
+```
+
+You should now be able to click the reconnect button on the MCP Servers section of Kiro on the left pannel (the little ghost).  The reconnect button will show when you hover over the MCP server.
+
+You should see "Connected" which means you're good to test using conversation in the Kiro describe task window.  
 
 4. **Test the Integration**:
    
@@ -767,10 +1094,12 @@ awscurl -X POST $ENDPOINT/tools/analyze_case_summaries \
    - "List the available case analysis tools"
    
    **Troubleshooting Kiro Integration**:
-   - **MCP server not connecting**: Check that `uvx` and `uv` are installed (`pip install uv`)
+   - **MCP server not connecting**: Check that `mcp_aws_client.py` exists and Python dependencies are installed (`pip install boto3 requests botocore`)
    - **Authentication errors**: Ensure your AWS credentials are configured (`aws configure`)
    - **Tool not found errors**: Verify the MCP server URL is correct and accessible
    - **Permission errors**: Confirm you have the MCP user policy attached to your AWS user/role
+   - **Python path issues**: Use absolute path to `mcp_aws_client.py` if needed
+   - **Environment variables**: Verify `MCP_SERVER_URL` and `AWS_REGION` are set correctly
 
 ### Using with Other AI Platforms
 
