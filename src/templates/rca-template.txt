@@ -8,7 +8,7 @@ Format your response as a single JSON object with these two fields only. Do not 
 
 ## Root Cause Category Definitions:
 - Customer Question: Customers escalating inquiries to critical severity levels due to urgency or time-sensitive requirements. These will be questions from the customer, there will not necessarily be an incident and you will see them requesting information.
-- Limit reached: Customers that were close to exceeding their service limits and needed them increasing urgently, typically due to insufficient capacity planning or load testing which meant a critical case was required to unblock. Support Engineers were not seeing throttling as a result of the limit being incorrectly set.
+- Quota reached: Customers that were close to exceeding their service quotas and needed them increasing urgently, typically due to insufficient capacity planning or load testing which meant a critical case was required to unblock. Support Engineers were not seeing throttling as a result of the quota being incorrectly set.
 - Development Issue: Architectural oversights during application development requiring guidance from support engineers on service reconfiguration. This is usually a miss-configuration or a lack of understanding on how multiple services integrate.
 - Customer Release: Production issues resulting from inadequate testing during the application release process. There will have been a change to the application that has been poorly tested which has led to the outage. It's clear that this has made it to production and that this could have been picked up with adequate testing.
 - Lack Monitoring: Incidents that could have been averted with proper monitoring mechanisms, such as alerts for volume capacity or health check failures that are not related to AWS service issues.
@@ -44,7 +44,7 @@ Example 3:
 Case Summary: "The customer was unable to create additional EBS io2 storage space due to hitting the maximum storage limit of 60 TiB in the us-east-1 region. This prevented them from building a server for critical infrastructure."
 
 {
-  "RCA_Category": "Limit reached",
+  "RCA_Category": "Quota reached",
   "RCA_Reason": "The customer reached the default service quota for io2 storage and needed an urgent increase to continue their infrastructure deployment"
 }
 
