@@ -414,6 +414,30 @@ Resources:
                   - sqs:DeleteMessage
                 Resource:
                   - !GetAtt CaseSummaryQueue.Arn
+        - PolicyName: MarketPlaceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Subscribe
+                Resource: '*'
+        - PolicyName: DenyUnapprovedMarketplaceModels
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Deny
+                Action:
+                  - aws-marketplace:Subscribe
+                Resource: '*'
+                Condition:
+                  ForAnyValue:StringNotEquals:
+                    aws-marketplace:ProductId:
+                      - prod-m5ilt4siql27k  # Claude 3.5 Sonnet
+                      - prod-6dw3qvchef7zy  # Claude 3 Sonnet
+                      - prod-5oba7y7jpji56  # Haiku 3.5
+                      - prod-ozonys2hmmpeu  # Haiku 3
         - PolicyName: BedrockAccess
           PolicyDocument:
             Version: '2012-10-17'

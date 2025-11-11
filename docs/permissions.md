@@ -119,6 +119,29 @@ The Support Case Insights solution uses several IAM roles to ensure the principl
   - Resources:
     - `SQS-CaseSummary`
 
+- **Market Place Access:**
+- PolicyName: MarketPlaceAccess
+    - aws-marketplace:ViewSubscriptions
+    - aws-marketplace:Subscribe
+    Resource: '*'
+
+- **DenyUnapprovedMarketplaceModels:**
+    - Effect: Deny
+        Action:
+            - aws-marketplace:Subscribe
+        Resource: '*'
+        Condition:
+            ForAnyValue:StringNotEquals:
+              aws-marketplace:ProductId:
+                      - prod-m5ilt4siql27k  # Claude 3.5 Sonnet
+                      - prod-6dw3qvchef7zy  # Claude 3 Sonnet
+                      - prod-5oba7y7jpji56  # Haiku 3.5
+                      - prod-ozonys2hmmpeu # Haiku 3
+
+NOTE:  This policy allows access for subscription to policies and the IDs come from this website:  https://docs.aws.amazon.com/bedrock/latest/userguide/model-access-product-ids.html
+
+Blog:  https://aws.amazon.com/blogs/security/implementing-least-privilege-access-for-amazon-bedrock/
+
 - **Bedrock Access:**
   - `bedrock:InvokeModel`
   - Resources:
