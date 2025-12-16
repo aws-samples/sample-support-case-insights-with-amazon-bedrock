@@ -286,17 +286,17 @@ cd aws-case-insights
 
 First, choose your unique identifiers that will be used throughout the deployment:
 
-- **Unique Identifier**: A short identifier added to all AWS resources (e.g., `255248`, `Prod21124`).  Remember Cloudformation will be creating buckets so make sure it's unique enough.  If you would like to check before hand, see the resources.md file for what gets created and pre-check the bucket names.
+- **Unique Identifier**: A short identifier added to all AWS resources (e.g., `255248125`, `Prod21124`).  Remember Cloudformation will be creating buckets so make sure it's unique enough.  If you would like to check before hand, see the resources.md file for what gets created and pre-check the bucket names.
 - **Deployment Bucket**: Must start with `case-insights-deployment-` (e.g., `case-insights-deployment-<uniqueID>`)
 
 **Example:**
-- Unique Identifier: `255248`
-- Deployment Bucket: `case-insights-deployment-255248`
+- Unique Identifier: `255248125`
+- Deployment Bucket: `case-insights-deployment-255248125`
 - Region: `us-east-1`
 
 This will create resources like:
-- Lambda functions: `Lambda-CaseRetrieval-255248`, `Step-CaseSummary-255248`
-- S3 buckets: `s3-255248-caseraw`, `s3-255248-caseprocessed`
+- Lambda functions: `Lambda-CaseRetrieval-255248125`, `Step-CaseSummary-255248125`
+- S3 buckets: `s3-255248125-caseraw`, `s3-255248125-caseprocessed`
 
 ### 2.3 Package Lambda Functions
 
@@ -333,9 +333,9 @@ python3 scripts/update-bucket-name.py cloudformation/case-insights.yaml <your-de
 **Example:**
 ```bash
 # Option A (recommended) - using identifiers from step 2.2
-./scripts/package-lambdas.sh case-insights-deployment-255248 us-east-1
+./scripts/package-lambdas.sh case-insights-deployment-255248125 us-east-1
 
-python3 scripts/update-bucket-name.py cloudformation/case-insights.yaml case-insights-deployment-255248
+python3 scripts/update-bucket-name.py cloudformation/case-insights.yaml case-insights-deployment-255248125
 ```
 
 ## Step 3: Understand the Processing Schedule
@@ -422,12 +422,12 @@ aws cloudformation create-stack \
 ```bash
 # Using identifiers from step 2.2
 aws cloudformation create-stack \
-  --template-url https://s3.amazonaws.com/case-insights-deployment-255248/case-insights-updated.yaml \
+  --template-url https://s3.amazonaws.com/case-insights-deployment-255248125/case-insights-updated.yaml \
   --stack-name aws-case-insights \
   --capabilities CAPABILITY_NAMED_IAM \
   --region us-east-1 \
   --parameters \
-  ParameterKey=UniqueIdentifier,ParameterValue=255248 \
+  ParameterKey=UniqueIdentifier,ParameterValue=255248125 \
   ParameterKey=OrganizationId,ParameterValue=o-84p3hidev6 \
   ParameterKey=DeploymentTimestamp,ParameterValue=$(date +%Y-%m-%d-%H-%M-%S)
 ```
